@@ -9,7 +9,7 @@ browser for the UI.
 
 How to run (once Python ≥3.9 is installed):
 >>> pip install streamlit pandas openpyxl
->>> streamlit run ta_matching_app.py
+>>> streamlit run app_core.py
 
 Then open the URL shown in the terminal (typically http://localhost:8501) in a
 browser.
@@ -26,12 +26,21 @@ import pandas as pd
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# Helper functions
 # ---------------------------------------------------------------------------
-
+def _read_main_or_first(uploaded_file):
+    """
+    Return a DataFrame from the sheet named 'main' (case-insensitive) if present;
+    otherwise use the first sheet.
+    """
+    xl = pd.ExcelFile(uploaded_file)
+    sheet_names = xl.sheet_names
+    name_map = {s.lower(): s for s in sheet_names}
+    target_sheet = name_map.get("main", sheet_names[0])
+    return xl.parse(sheet_name=target_sheet)
 
 def _find_col(df: pd.DataFrame, substr: str) -> str:
-    """Locate the first column whose *header* contains ``substr`` (case‑insensitive)."""
+    """Locate the first column whose *header* contains ``substr`` (case-insensitive)."""
     for col in df.columns:
         if substr.lower() in col.lower():
             return col
@@ -42,7 +51,7 @@ def _canonicalize_name(raw: str | float | int) -> str | None:
     """Convert a raw name string into the canonical "Firstname LASTNAME" form.
 
     Returns ``None`` when the entry represents *no specific person* (e.g.
-    ``"None. Ph.D. with strong math"``).
+    ``"None. Ph.D. with strong math"``).
     """
     if pd.isna(raw):
         return None
@@ -76,7 +85,7 @@ def _canonicalize_name(raw: str | float | int) -> str | None:
 
 
 def _parse_name_list(raw: str | float | int) -> List[str]:
-    """Split a string like ``"Haotian MA, Tianci HOU"`` into a list of canonical names."""
+    """Split a string like ``"Haotian MA, Tianci HOU"`` into a list of canonical names."""
     if pd.isna(raw):
         return []
     names = [n.strip() for n in str(raw).replace(";", ",").split(",")]
@@ -109,10 +118,18 @@ def _parse_ustf_cell(cell: str | float | int) -> Tuple[int, int, List[str]]:
     min_n = int(m.group(1)) if m else 0
     max_n = int(m.group(2)) if m else 0
     # Strip the leading range spec then parse the remaining name part.
-    names_part = re.sub(r"\[.*?\]", "", text)
+    match = re.search(r"\((.*?)\)", text)
+    names_part = match.group(1) if match else ""
     names = _parse_name_list(names_part)
     return min_n, max_n, names
 
+def _get_student_id(raw_id: str | float | int) -> str:
+    """Convert a raw student ID to a string, removing any trailing .0."""
+    if pd.isna(raw_id):
+        return "unknown"
+    if isinstance(raw_id, float) and raw_id.is_integer():
+        return str(int(raw_id))
+    return str(raw_id).strip()
 
 # ---------------------------------------------------------------------------
 # Core processing
@@ -120,9 +137,9 @@ def _parse_ustf_cell(cell: str | float | int) -> Tuple[int, int, List[str]]:
 
 
 def load_instructor_sheet(df: pd.DataFrame) -> Dict[str, dict]:
-    """Extract and normalise information course‑by‑course.
+    """Extract and normalise information course-by-course.
 
-    Returns a mapping *course_code* → metadata‑dict.
+    Returns a mapping *course_code* → metadata-dict.
     """
     course_code_col = _find_col(df, "Course code")
     instructor_col = _find_col(df, "Course instructor's name")
@@ -139,17 +156,30 @@ def load_instructor_sheet(df: pd.DataFrame) -> Dict[str, dict]:
 
         pref_names, req_comment = _parse_instructor_pref_cell(row[pref_ta_col])
         lead_names, _ = _parse_instructor_pref_cell(row[pref_lead_col])
-        pref_names.extend(lead_names)  # treat leading TA as part of preference list.
+        # Remove names that are in lead_names from pref_names
+        pref_names = [name for name in pref_names if name not in lead_names]
 
         min_u, max_u, ustf_names = _parse_ustf_cell(row[ustf_col])
-
+        
+        # Combine comments.
+        comment_parts = []
+        if req_comment:
+            comment_parts.append(req_comment)
+        raw_remark = row[remarks_col]
+        if not pd.isna(raw_remark):
+            s = str(raw_remark).strip()
+            if s:
+                comment_parts.append(s)
+        instr_comments = ". ".join(comment_parts)
+        
         courses[code] = {
             "instructor": str(row[instructor_col]).strip(),
             "pref_names": pref_names,
+            "lead_names": lead_names,
             "ustf_instr": ustf_names,
             "ustf_range": (min_u, max_u),
-            "instr_comments": ". ".join([req_comment, str(row[remarks_col]).strip()]).strip(" ."),
-            # Place‑holders for matching results
+            "instr_comments": instr_comments,
+            # Place-holders for matching results
             "ta_both": [],
             "ta_instr_only": [],
             "ta_student_only": [],
@@ -163,9 +193,9 @@ def load_instructor_sheet(df: pd.DataFrame) -> Dict[str, dict]:
 def load_student_sheet(df: pd.DataFrame) -> Tuple[Dict[str, dict], Dict[str, str]]:
     """Return (student_id_map, name→id).
 
-    *student_id_map* maps student‑id → student‑info‑dict.
+    *student_id_map* maps student-id → student-info-dict.
     """
-    name_col = _find_col(df, "Student Name")
+    name_col = _find_col(df, "Normalized Name")
     id_col = _find_col(df, "Student ID")
     major_col = _find_col(df, "Major/Fields")
     cohort_col = _find_col(df, "Cohort")
@@ -184,11 +214,19 @@ def load_student_sheet(df: pd.DataFrame) -> Tuple[Dict[str, dict], Dict[str, str
     name_to_id: Dict[str, str] = {}
 
     for _, row in df.iterrows():
-        sid = str(row[id_col]).strip()
+        sid = _get_student_id(row[id_col])
         name = _canonicalize_name(row[name_col]) or ""
         if not sid or not name:
             continue
         prefs = [str(row[c]).replace(" ", "").strip() for c in pri_cols if not pd.isna(row[c]) and str(row[c]).strip()]
+        
+        # process other information
+        raw_other = row[other_col]
+        if pd.isna(raw_other):
+            other_str = ""
+        else:
+            other_str = str(raw_other).strip()
+        
         student_map[sid] = {
             "name": name,
             "prefs": prefs,
@@ -196,7 +234,7 @@ def load_student_sheet(df: pd.DataFrame) -> Tuple[Dict[str, dict], Dict[str, str
             "cohort": str(row[cohort_col]).strip(),
             "supervisor": str(row[supervisor_col]).strip(),
             "ustf_remark": _parse_name_list(row[ustf_remark_col]),
-            "other": str(row[other_col]).strip(),
+            "other": other_str,
         }
         name_to_id[name] = sid
 
@@ -204,11 +242,11 @@ def load_student_sheet(df: pd.DataFrame) -> Tuple[Dict[str, dict], Dict[str, str
 
 
 def perform_matching(courses: Dict[str, dict], student_map: Dict[str, dict], name_to_id: Dict[str, str]):
-    """Populate *courses* in‑place and return a set of *matched student‑ids*."""
+    """Populate *courses* in-place and return a set of *matched student-ids*."""
 
     matched: set[str] = set()
 
-    # Pass 1 – two‑sided preferences.
+    # Pass 1 – two-sided preferences.
     for code, meta in courses.items():
         for pref_name in meta["pref_names"]:
             sid = name_to_id.get(pref_name)
@@ -218,7 +256,7 @@ def perform_matching(courses: Dict[str, dict], student_map: Dict[str, dict], nam
                 meta["ta_both"].append((pref_name, sid))
                 matched.add(sid)
 
-    # Pass 2 – instructor‑only.
+    # Pass 2 – instructor-only.
     for code, meta in courses.items():
         for pref_name in meta["pref_names"]:
             sid = name_to_id.get(pref_name)
@@ -227,7 +265,7 @@ def perform_matching(courses: Dict[str, dict], student_map: Dict[str, dict], nam
             meta["ta_instr_only"].append((pref_name, sid))
             matched.add(sid)
 
-    # Pass 3 – student‑only preferences.
+    # Pass 3 – student-only preferences.
     for sid, sinfo in student_map.items():
         if sid in matched:
             continue
@@ -236,6 +274,15 @@ def perform_matching(courses: Dict[str, dict], student_map: Dict[str, dict], nam
                 courses[pref_code]["ta_student_only"].append((sinfo["name"], sid))
                 matched.add(sid)
                 break  # Only one course per student.
+    
+    # Pass 4 – leading TAs.
+    for code, meta in courses.items():
+        leading_pairs: List[Tuple[str, str]] = []
+        for lead_name in meta.get("lead_names", []):
+            sid = name_to_id.get(lead_name)
+            leading_pairs.append((lead_name, sid))     
+        # Store for downstream use (e.g. build_assignment_dataframe)
+        meta["leading_ta"] = leading_pairs
 
     # USTF from TA remarks + comments gathering.
     for code, meta in courses.items():
@@ -249,7 +296,7 @@ def perform_matching(courses: Dict[str, dict], student_map: Dict[str, dict], nam
                 if other:
                     meta["ta_comments"].append(f"{name}: {other}")
 
-        # De‑duplicate USTF lists.
+        # De-duplicate USTF lists.
         meta["ustf_instr"] = list(dict.fromkeys(meta["ustf_instr"]))
         meta["ustf_ta"] = list(dict.fromkeys(meta["ustf_ta"]))
 
@@ -264,9 +311,10 @@ def build_assignment_dataframe(courses: Dict[str, dict]) -> pd.DataFrame:
         row = {
             "Course code": code,
             "Instructor": m["instructor"],
-            "TA (both‑side)": ", ".join(n for n, _ in m["ta_both"]),
-            "TA (single‑side: instructor)": make_str(m["ta_instr_only"]),
-            "TA (single‑side: student)": make_str(m["ta_student_only"]),
+            "Leading TA": make_str(m["leading_ta"]),
+            "TA (both-side)": make_str(m["ta_both"]),
+            "TA (single-side: instructor)": make_str(m["ta_instr_only"]),
+            "TA (single-side: student)": make_str(m["ta_student_only"]),
             "USTF (instructor)": ", ".join(m["ustf_instr"]),
             "USTF (TA)": ", ".join(m["ustf_ta"]),
             "Comments (Instructor)": m["instr_comments"],
@@ -283,6 +331,7 @@ def build_unmatched_dataframe(student_map: Dict[str, dict], matched: set[str]) -
             continue
         row = {
             "Student Name": s["name"],
+            "Student ID": sid,
             "Major/Fields": s["major"],
             "Cohort": s["cohort"],
             "Supervisor": s["supervisor"],
@@ -300,20 +349,22 @@ def build_unmatched_dataframe(student_map: Dict[str, dict], matched: set[str]) -
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="TA Matching Assistant", layout="wide")
-st.title("📚 EasyMatcher for Course TA/USTF (By Xiaoyuan Liu)")
+st.set_page_config(page_title="EasyMatcher CUHKSZ", layout="wide")
+st.title("📚 EasyMatcher for Course TA/USTF (By Xiaoyuan Liu)")
 
 st.markdown(
-    "Upload the instructor‑preference sheet **and** the student‑preference sheet (both XLSX).  \n"
+    "Upload the instructor-preference sheet **and** the student-preference sheet (both XLSX).  \n"
     "After the preview you may **Generate** the assignment file or manually add / remove students.")
 
-instr_file = st.file_uploader("Instructor preference XLSX", type=["xlsx"], key="instr")
-stud_file = st.file_uploader("Student preference XLSX", type=["xlsx"], key="stud")
+st.markdown("## Instructor preference XLSX")
+instr_file = st.file_uploader("Upload instructor's preference file 👇", type=["xlsx"], key="instr")
+st.markdown("## Student preference XLSX")
+stud_file = st.file_uploader("Upload student's preference file 👇", type=["xlsx"], key="stud")
 
 if instr_file and stud_file:
     try:
-        instr_df = pd.read_excel(instr_file, engine="openpyxl")
-        stud_df = pd.read_excel(stud_file, engine="openpyxl")
+        instr_df = _read_main_or_first(instr_file)
+        stud_df  = _read_main_or_first(stud_file)
     except Exception as e:
         st.error(f"Failed to read XLSX files: {e}")
         st.stop()
@@ -333,22 +384,22 @@ if instr_file and stud_file:
         st.session_state.student_map = student_map
         st.session_state.matched = matched_sids
 
-    st.subheader("📑 Preview – Course Assignments")
+    st.subheader("📑 Preview - Course Assignments")
     st.dataframe(st.session_state.assign_df, use_container_width=True)
 
-    st.subheader("🚧 Students Still Unmatched")
+    st.subheader("🚧 Students Still Unmatched")
     st.dataframe(st.session_state.unmatched_df, use_container_width=True)
 
     # ---------------------------------------------------------------------
     # Manual editing controls
     # ---------------------------------------------------------------------
-    with st.expander("✏️ Manually add / remove student", expanded=False):
+    with st.expander("✏️ Manually add / remove student", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
             action = st.selectbox("Action", ["Add", "Remove"])
             course_sel = st.text_input("Course code (exact)")
         with col2:
-            student_id_sel = st.text_input("Student ID")
+            student_id_sel = st.text_input("Student ID")
             go = st.button("Apply change")
 
         if go and course_sel and student_id_sel:
@@ -366,7 +417,7 @@ if instr_file and stud_file:
                     # Prevent double add.
                     present = any(name_pair in c_meta[k] for k in ("ta_both", "ta_instr_only", "ta_student_only"))
                     if not present:
-                        c_meta["ta_student_only"].append(name_pair)  # treat as student‑side add.
+                        c_meta["ta_student_only"].append(name_pair)  # treat as student-side add.
                         # Remove from unmatched if present.
                         if student_id_sel in st.session_state.matched:
                             pass  # Already matched elsewhere.
@@ -396,7 +447,7 @@ if instr_file and stud_file:
                 st.session_state.unmatched_df = build_unmatched_dataframe(
                     st.session_state.student_map, st.session_state.matched
                 )
-                st.success("Update applied ✔️")
+                st.success("Update applied ✔️")
 
     # ---------------------------------------------------------------------
     # Generate XLSX for download
@@ -408,7 +459,7 @@ if instr_file and stud_file:
     buffer.seek(0)
 
     st.download_button(
-        label="📥 Generate XLSX",
+        label="📥 Generate XLSX",
         data=buffer,
         file_name="TA_Assignments.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
