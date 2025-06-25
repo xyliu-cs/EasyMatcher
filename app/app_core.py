@@ -21,9 +21,11 @@ import re
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Tuple
+from prompts_md import REQ_MD, ALG_MD
 
 import pandas as pd
 import streamlit as st
+import time
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -123,7 +125,7 @@ def _parse_ustf_cell(cell: str | float | int) -> Tuple[int, int, List[str]]:
     names = _parse_name_list(names_part)
     return min_n, max_n, names
 
-def _get_student_id(raw_id: str | float | int) -> str:
+def _get_id(raw_id: str | float | int) -> str:
     """Convert a raw student ID to a string, removing any trailing .0."""
     if pd.isna(raw_id):
         return "unknown"
@@ -214,7 +216,7 @@ def load_student_sheet(df: pd.DataFrame) -> Tuple[Dict[str, dict], Dict[str, str
     name_to_id: Dict[str, str] = {}
 
     for _, row in df.iterrows():
-        sid = _get_student_id(row[id_col])
+        sid = _get_id(row[id_col])
         name = _canonicalize_name(row[name_col]) or ""
         if not sid or not name:
             continue
@@ -231,7 +233,7 @@ def load_student_sheet(df: pd.DataFrame) -> Tuple[Dict[str, dict], Dict[str, str
             "name": name,
             "prefs": prefs,
             "major": str(row[major_col]).strip(),
-            "cohort": str(row[cohort_col]).strip(),
+            "cohort": _get_id(row[cohort_col]),
             "supervisor": str(row[supervisor_col]).strip(),
             "ustf_remark": _parse_name_list(row[ustf_remark_col]),
             "other": other_str,
@@ -287,18 +289,19 @@ def perform_matching(courses: Dict[str, dict], student_map: Dict[str, dict], nam
     # USTF from TA remarks + comments gathering.
     for code, meta in courses.items():
         # From assigned students (any category) pick up their ustf remarks and other info.
-        for cat in ("ta_both", "ta_instr_only", "ta_student_only"):
+        for cat in ("leading_ta", "ta_both", "ta_instr_only", "ta_student_only"):
             for name, sid in meta[cat]:
-                ustf_from_ta = student_map[sid]["ustf_remark"]
-                if ustf_from_ta:
-                    meta["ustf_ta"].extend(u for u in ustf_from_ta if u not in meta["ustf_ta"])
-                other = student_map[sid]["other"]
-                if other:
-                    meta["ta_comments"].append(f"{name}: {other}")
+                if sid in student_map:
+                    ustf_from_ta = student_map[sid]["ustf_remark"]
+                    if ustf_from_ta:
+                        meta["ustf_ta"].extend(u for u in ustf_from_ta if u not in meta["ustf_ta"])
+                    other = student_map[sid]["other"]
+                    if other:
+                        meta["ta_comments"].append(f"{name}: {other}")
 
-        # De-duplicate USTF lists.
-        meta["ustf_instr"] = list(dict.fromkeys(meta["ustf_instr"]))
-        meta["ustf_ta"] = list(dict.fromkeys(meta["ustf_ta"]))
+        # Convert USTF lists to name pairs with None as student ID
+        meta["ustf_instr"] = [(name, None) for name in list(dict.fromkeys(meta["ustf_instr"]))]
+        meta["ustf_ta"] = [(name, None) for name in list(dict.fromkeys(meta["ustf_ta"]))]
 
     return matched
 
@@ -315,8 +318,8 @@ def build_assignment_dataframe(courses: Dict[str, dict]) -> pd.DataFrame:
             "TA (both-side)": make_str(m["ta_both"]),
             "TA (single-side: instructor)": make_str(m["ta_instr_only"]),
             "TA (single-side: student)": make_str(m["ta_student_only"]),
-            "USTF (instructor)": ", ".join(m["ustf_instr"]),
-            "USTF (TA)": ", ".join(m["ustf_ta"]),
+            "USTF (instructor)": make_str(m["ustf_instr"]),
+            "USTF (TA)": make_str(m["ustf_ta"]),
             "Comments (Instructor)": m["instr_comments"],
             "Comments (TA)": ". ".join(m["ta_comments"]),
         }
@@ -350,11 +353,26 @@ def build_unmatched_dataframe(student_map: Dict[str, dict], matched: set[str]) -
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="EasyMatcher CUHKSZ", layout="wide")
-st.title("📚 EasyMatcher for Course TA/USTF (By Xiaoyuan Liu)")
+st.title("📚 EasyMatcher for Course TA/USTF")
 
 st.markdown(
     "Upload the instructor-preference sheet **and** the student-preference sheet (both XLSX).  \n"
     "After the preview you may **Generate** the assignment file or manually add / remove students.")
+
+st.markdown("### ‼️ <span style='color: red;'>Important Notes</span>", unsafe_allow_html=True)
+col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
+with col1:
+    show_req = st.button("📋 File Requirements")
+with col2:
+    show_alg = st.button("⚙️ Matching Rules")
+
+if show_req:
+    with st.expander("📋 File Requirements", expanded=True):
+        st.markdown(REQ_MD)
+
+if show_alg:
+    with st.expander("⚙️ Matching Rules", expanded=True):
+        st.markdown(ALG_MD)
 
 st.markdown("## Instructor preference XLSX")
 instr_file = st.file_uploader("Upload instructor's preference file 👇", type=["xlsx"], key="instr")
@@ -393,16 +411,20 @@ if instr_file and stud_file:
     # ---------------------------------------------------------------------
     # Manual editing controls
     # ---------------------------------------------------------------------
-    with st.expander("✏️ Manually add / remove student", expanded=False):
+    with st.expander("✏️ Manual Edit", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
             action = st.selectbox("Action", ["Add", "Remove"])
             course_sel = st.text_input("Course code (exact)")
         with col2:
             student_id_sel = st.text_input("Student ID")
+            # Show role selection when action is "Add"
+            if action == "Add":
+                role = st.selectbox("Add as", ["Normal TA", "Leading TA", "USTF"])
             go = st.button("Apply change")
 
         if go and course_sel and student_id_sel:
+            success = False
             course_sel = course_sel.replace(" ", "").strip()
             if course_sel not in st.session_state.courses:
                 st.error("Unknown course code.")
@@ -412,42 +434,74 @@ if instr_file and stud_file:
                 s_info = st.session_state.student_map[student_id_sel]
                 name_pair = (s_info["name"], student_id_sel)
                 c_meta = st.session_state.courses[course_sel]
-
+                
+                # Manual ADDITION
                 if action == "Add":
-                    # Prevent double add.
-                    present = any(name_pair in c_meta[k] for k in ("ta_both", "ta_instr_only", "ta_student_only"))
-                    if not present:
-                        c_meta["ta_student_only"].append(name_pair)  # treat as student-side add.
-                        # Remove from unmatched if present.
-                        if student_id_sel in st.session_state.matched:
-                            pass  # Already matched elsewhere.
-                        else:
+                    present_anywhere = any(
+                        name_pair in c_meta.get(cat, [])
+                        for cat in ("leading_ta", "ta_both", "ta_instr_only", "ta_student_only", "ustf_instr", "ustf_ta")
+                    )
+
+                    # -----------------  Normal TA  -----------------
+                    if role == "Normal TA":
+                        if not present_anywhere:
+                            # treat as instructor-side add, mirroring original behaviour
+                            c_meta["ta_instr_only"].append(name_pair)
                             st.session_state.matched.add(student_id_sel)
-                    else:
-                        st.warning("Student already listed for this course.")
-                else:  # Remove
+                            success = True
+                        else:
+                            st.warning("Student already listed for this course.")
+
+                    # -----------------  Leading TA  ----------------
+                    elif role == "Leading TA":
+                        if not present_anywhere:
+                            c_meta.setdefault("leading_ta", []).append(name_pair)
+                            st.session_state.matched.add(student_id_sel)
+                            success = True
+                        else:
+                            st.warning("Student already listed for this course.")
+
+                    # -----------------  USTF tag  ------------------
+                    else:  # role == "USTF"
+                        ustf_name = s_info["name"]
+                        ustf_name_list = [n for n, _ in c_meta["ustf_instr"]]
+                        ustf_name_list.extend(n for n, _ in c_meta["ustf_ta"])
+                        if ustf_name not in ustf_name_list:
+                            c_meta["ustf_instr"].append(name_pair)
+                            st.session_state.matched.add(student_id_sel)
+                            success = True
+                        else:
+                            st.warning("Student already listed under USTF for this course.")
+                
+                # Manual REMOVAL
+                elif action == "Remove":
                     removed = False
-                    for cat in ("ta_both", "ta_instr_only", "ta_student_only"):
+                    for cat in ("leading_ta", "ta_both", "ta_instr_only", "ta_student_only", "ustf_instr", "ustf_ta"):
                         if name_pair in c_meta[cat]:
                             c_meta[cat].remove(name_pair)
                             removed = True
+                            success = True
                     if not removed:
                         st.warning("Student not found in this course.")
                     # Add back to unmatched list if student no longer assigned anywhere.
                     still_assigned = any(
                         name_pair in m[cat]
                         for m in st.session_state.courses.values()
-                        for cat in ("ta_both", "ta_instr_only", "ta_student_only")
+                        for cat in ("leading_ta", "ta_both", "ta_instr_only", "ta_student_only")
                     )
                     if not still_assigned and student_id_sel in st.session_state.matched:
                         st.session_state.matched.remove(student_id_sel)
-
+                        success = True
+                
+                if success:
+                    st.success("Update applied ✔️")
                 # Rebuild DataFrames in session_state
                 st.session_state.assign_df = build_assignment_dataframe(st.session_state.courses)
                 st.session_state.unmatched_df = build_unmatched_dataframe(
                     st.session_state.student_map, st.session_state.matched
                 )
-                st.success("Update applied ✔️")
+                time.sleep(1)
+                st.rerun()  # Refresh the page to show updated data
 
     # ---------------------------------------------------------------------
     # Generate XLSX for download
@@ -463,4 +517,23 @@ if instr_file and stud_file:
         data=buffer,
         file_name="TA_Assignments.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+# ---------------------------------------------------------------------
+# Credit information frame
+# ---------------------------------------------------------------------
+st.markdown("---")
+with st.container():
+    st.info(
+        """
+        💡 **About**
+        
+        **EasyMatcher** is a tool developed to streamline the TA/USTF assignment process for CUHK-Shenzhen.  
+        **Website:** https://github.com/xyliu-cs/EasyMatcher  
+        **Version:** Preview Release  
+        **Developer:** SDS PhD Office, Xiaoyuan Liu  
+        **Contact:** xiaoyuanliu@link.cuhk.edu.cn  
+
+        *Disclaimer: This tool is designed only to assist with course assignments and should be reviewed by instructors/school before final decisions.*
+        """
     )
