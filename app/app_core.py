@@ -224,19 +224,35 @@ def _canon_chn_name(s: str | float | int) -> str:
 
 
 def _parse_int(val) -> Optional[int]:
-    """Return int if val looks numeric (e.g., '3', 3.0, ' 2 '), else None."""
+    """Return int if val is numeric, rounding decimals to nearest integer; else None."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
-    s = str(val).strip()
-    if not s:
+    try:
+        num = float(str(val).strip())
+        return int(round(num))
+    except (ValueError, TypeError):
         return None
-    m = re.match(r"^\s*(\d+)(?:\.0+)?\s*$", s)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    return None
+
+
+def _quota_remaining(meta: dict) -> int:
+    """Remaining slots for this course (leading + all TA buckets count)."""
+    q = _parse_int(meta.get("ta_slots", ""))
+    if q is None or q < 0:
+        q = 0
+    assigned = _count_assigned_including_leading(meta)
+    return max(0, q - assigned)
+
+def _remaining_slots_map(courses: Dict[str, dict]) -> Dict[str, int]:
+    """code -> remaining slots (non-negative)."""
+    return {c: _quota_remaining(m) for c, m in courses.items()}
+
+def _eligible_codes_by_priority(courses: Dict[str, dict], rem: Dict[str, int]) -> list[str]:
+    """Course codes with remaining capacity, sorted by (type priority, code)."""
+    return sorted(
+        [c for c in courses if rem.get(c, 0) > 0],
+        key=lambda c: (_course_rank(courses[c].get("type", "")), c)
+    )
+
 
 
 # ======================================================================
@@ -573,9 +589,8 @@ def perform_matching(courses_from_instr: Dict[str, dict],
 # ======================================================================
 # Semantic & fallbacks (guaranteed completion)
 # ======================================================================
-
 def _semantic_assign_unmatched(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
-    """TF-IDF cosine(student background vs course text)."""
+    """TF-IDF cosine(student background vs course text), respecting remaining capacity."""
     if not _HAS_SKLEARN:
         LOG.log("WARN", "SEMANTIC_DISABLED", detail="scikit-learn not installed")
         return
@@ -588,72 +603,94 @@ def _semantic_assign_unmatched(courses: Dict[str, dict], student_map: Dict[str, 
 
     vectorizer = TfidfVectorizer(max_features=4000, ngram_range=(1, 2))
     Xc = vectorizer.fit_transform(course_texts)
+    code_to_idx = {c: i for i, c in enumerate(course_codes)}
+
+    rem = _remaining_slots_map(courses)
 
     for sid, s in student_map.items():
         if sid in matched:
             continue
-        stxt = " ".join(filter(None, [s.get("major",""), s.get("field",""), s.get("supervisor_en",""), s.get("supervisor_zh","")]))
+        elig = _eligible_codes_by_priority(courses, rem)
+        if not elig:
+            break
+        stxt = " ".join(filter(None, [s.get("major",""), s.get("field",""),
+                                      s.get("supervisor_en",""), s.get("supervisor_zh","")]))
         if not stxt.strip():
             LOG.log("WARN", "NO_BACKGROUND_TEXT", student_id=sid, student_name=s.get("name",""))
             continue
         xs = vectorizer.transform([stxt])
         sims = cosine_similarity(xs, Xc).ravel()
-        best_idx = int(sims.argmax())
-        best_score = float(sims[best_idx])
-        best_code = course_codes[best_idx]
-        if best_score > 0:
+        best_code, best_score = None, -1.0
+        for code in elig:
+            sc = float(sims[code_to_idx[code]])
+            if sc > best_score:
+                best_score, best_code = sc, code
+        if best_code is not None and rem.get(best_code, 0) > 0:
             courses[best_code]["ta_student_only"].append((s.get("name", sid), sid))
             matched.add(sid)
-            LOG.log("INFO", "MATCH", course=best_code, student_id=sid, student_name=s.get("name",""),
+            rem[best_code] -= 1
+            LOG.log("INFO", "MATCH", course=best_code, student_id=sid,
+                    student_name=s.get("name",""),
                     detail=f"Semantic background match (score={best_score:.4f})")
-        else:
-            LOG.log("WARN", "SEMANTIC_NO_OVERLAP", student_id=sid, student_name=s.get("name",""))
-
 
 def _keyword_fallback_assign(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
-    """Cheap keyword overlap fallback when TF-IDF not available or empty."""
-    ordered_codes = sorted(courses.keys(), key=lambda c: (_course_rank(courses[c].get("type","")), c))
+    """Cheap keyword overlap fallback, respecting remaining capacity."""
+    rem = _remaining_slots_map(courses)
+    def ordered_eligible():
+        return _eligible_codes_by_priority(courses, rem)
     for sid, s in student_map.items():
         if sid in matched:
             continue
+        elig = ordered_eligible()
+        if not elig:
+            break
         tokens = set(re.findall(r"[A-Za-z]+", " ".join([
             s.get("major",""), s.get("field",""), s.get("supervisor_en",""), s.get("supervisor_zh","")
         ]).lower()))
         best_code, best_hit = None, -1
-        for code in ordered_codes:
+        for code in elig:
             text = (courses[code].get("title","") + " " + courses[code].get("desc","")).lower()
             hit = sum(1 for t in tokens if t and t in text)
             if hit > best_hit:
-                best_hit = hit
-                best_code = code
-        if best_code is not None and best_hit >= 0:
+                best_hit, best_code = hit, code
+        if best_code is not None and rem.get(best_code, 0) > 0:
             courses[best_code]["ta_student_only"].append((s.get("name", sid), sid))
             matched.add(sid)
-            LOG.log("INFO", "MATCH", course=best_code, student_id=sid, student_name=s.get("name",""),
+            rem[best_code] -= 1
+            LOG.log("INFO", "MATCH", course=best_code, student_id=sid,
+                    student_name=s.get("name",""),
                     detail=f"Keyword fallback (hits={best_hit})")
 
-
 def _balanced_fill_any_remaining(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
-    """Ensure no student is left unmatched: assign remaining by load-balancing into high-priority courses."""
-    if all(sid in matched for sid in student_map.keys()):
-        return
-    ordered_codes = sorted(courses.keys(), key=lambda c: (_course_rank(courses[c].get("type","")), c))
+    """As a last resort, place remaining students by load-balance into courses with capacity."""
+    rem = _remaining_slots_map(courses)
+    def eligible():
+        return _eligible_codes_by_priority(courses, rem)
     def count_tas(meta: dict) -> int:
-        return sum(len(meta.get(k, [])) for k in ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"))
+        return sum(len(meta.get(k, [])) for k in
+                   ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"))
     for sid, s in student_map.items():
         if sid in matched:
             continue
+        elig = eligible()
+        if not elig:
+            break
         sup_names = set(x for x in [
             _canon_eng_name(s.get("supervisor_en","")),
             _canon_chn_name(s.get("supervisor_zh","")),
             s.get("supervisor_en",""), s.get("supervisor_zh","")
         ] if x)
-        candidates = [c for c in ordered_codes if courses[c].get("instructors_set", set()) & sup_names] or ordered_codes
-        best_code = min(candidates, key=lambda c: (count_tas(courses[c]), _course_rank(courses[c].get("type","")), c))
-        courses[best_code]["ta_student_only"].append((s.get("name", sid), sid))
-        matched.add(sid)
-        LOG.log("INFO", "MATCH", course=best_code, student_id=sid, student_name=s.get("name",""),
-                detail="Balanced final assignment")
+        elig_sup = [c for c in elig if courses[c].get("instructors_set", set()) & sup_names]
+        pool = elig_sup or elig
+        best_code = min(pool, key=lambda c: (count_tas(courses[c]),
+                                             _course_rank(courses[c].get("type","")), c))
+        if rem.get(best_code, 0) > 0:
+            courses[best_code]["ta_student_only"].append((s.get("name", sid), sid))
+            matched.add(sid)
+            rem[best_code] -= 1
+            LOG.log("INFO", "MATCH", course=best_code, student_id=sid,
+                    student_name=s.get("name",""),
+                    detail="Balanced final assignment")
 
 
 def semantic_and_fallback_fill(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
@@ -666,198 +703,144 @@ def semantic_and_fallback_fill(courses: Dict[str, dict], student_map: Dict[str, 
 # NEW: Strict per-course TA cap enforcement (based on Teaching Assignment)
 # ======================================================================
 
-def _current_ta_lists(meta: dict) -> Tuple[List[Tuple[str, Optional[str]]], List[Tuple[str, Optional[str]]], List[Tuple[str, Optional[str]]]]:
-    """Return references to modifiable TA lists (non-leading, non-USTF)."""
-    return meta.setdefault("ta_supervisor", []), meta.setdefault("ta_instr_only", []), meta.setdefault("ta_student_only", [])
+def _unmatched_count(student_map: Dict[str, dict], matched_sids: set[str]) -> int:
+    return sum(1 for sid in student_map if sid not in matched_sids)
 
-def _iter_all_nonleading(meta: dict) -> List[Tuple[str, Optional[str], str]]:
-    """Flatten non-leading TAs to [(name,sid,cat)] in priority order KEEPING original order within each cat."""
-    items: List[Tuple[str, Optional[str], str]] = []
-    for cat in ("ta_supervisor", "ta_instr_only", "ta_student_only"):
-        for name, sid in meta.get(cat, []):
-            items.append((name, sid, cat))
-    return items
+def _total_open_slots(courses_assign: Dict[str, dict]) -> int:
+    total = 0
+    for _, meta in courses_assign.items():
+        raw = meta.get("ta_slots", "")
+        q = _parse_int(raw)
+        # Treat non-integer / negative as 0 (hard cap)
+        if q is None or q < 0:
+            q = 0
+        assigned = sum(len(meta.get(k, [])) for k in ("leading_ta", "ta_supervisor", "ta_instr_only", "ta_student_only"))
+        total += max(0, q - assigned)
+    return total
 
-def _remove_sid_from_other_courses(courses: Dict[str, dict], code_keep: str, sid: str):
-    """Helper to ensure we only drop from the course we're pruning; not used to move between courses."""
-    # No cross-course removal for safety in this pass.
-    return
-
-def _rank_candidates_for_course(code: str, meta: dict, student_map: Dict[str, dict], matched: set[str],
-                                vectorizer: Optional[TfidfVectorizer] = None,
-                                course_vec = None) -> List[Tuple[str, float]]:
+def enforce_ta_caps(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]) -> List[str]:
     """
-    Return list of (sid, score) descending for filling: prefer students who
-    (a) prefer this course, (b) supervisor matches instructors, then (c) semantic/keyword score.
-    Score is a composite float; higher is better.
+    Strictly enforce per-course TA caps from Teaching Assignment ("ta_slots").
+    - Leading TAs are counted toward the cap.
+    - Any non-integer/blank TA number is treated as 0.
+    - On overflow, we keep in this priority order: leading_ta -> ta_supervisor -> ta_instr_only -> ta_student_only.
+    - Return the list of pruned student IDs (to be rematched globally).
     """
-    inst_set = meta.get("instructors_set", set())
-    title_desc = f"{meta.get('title','')} {meta.get('desc','')}".strip()
-
-    # Prepare TF-IDF vector for course if provided
-    use_sem = _HAS_SKLEARN and vectorizer is not None and course_vec is not None
-
-    ranked = []
-    for sid, s in student_map.items():
-        if sid in matched:
-            continue
-        prefs = s.get("prefs", [])
-        try:
-            pref_pos = prefs.index(code)  # 0 best
-            pref_bonus = 1.0 + (1.0 / (1 + pref_pos))  # 2.0, 1.5, 1.33, 1.25 ...
-        except ValueError:
-            pref_bonus = 1.0
-
-        sup_names = set(x for x in [
-            _canon_eng_name(s.get("supervisor_en","")),
-            _canon_chn_name(s.get("supervisor_zh","")),
-            s.get("supervisor_en",""), s.get("supervisor_zh","")
-        ] if x)
-        sup_bonus = 1.3 if (inst_set & sup_names) else 1.0
-
-        base = 0.0
-        if use_sem:
-            stxt = " ".join(filter(None, [s.get("major",""), s.get("field",""), s.get("supervisor_en",""), s.get("supervisor_zh","")]))
-            if stxt.strip():
-                xs = vectorizer.transform([stxt])
-                base = float(cosine_similarity(xs, course_vec).ravel()[0])
-        else:
-            # keyword overlap fallback
-            tokens = set(re.findall(r"[A-Za-z]+", " ".join([
-                s.get("major",""), s.get("field",""), s.get("supervisor_en",""), s.get("supervisor_zh","")
-            ]).lower()))
-            text = title_desc.lower()
-            base = float(sum(1 for t in tokens if t and t in text))
-
-        score = (base + 1e-6) * pref_bonus * sup_bonus
-        ranked.append((sid, score))
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    return ranked
-
-def enforce_ta_caps(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
-    """
-    Enforce per-course TA caps from Teaching Assignment -> 'ta_slots'.
-    Only counts normal TA buckets: ta_supervisor + ta_instr_only + ta_student_only.
-    Leading TAs and USTF are NOT capped here.
-    """
-    # Build one TF-IDF space once for semantic fill
-    vectorizer = None
-    course_vecs = {}
-    if _HAS_SKLEARN:
-        course_codes = list(courses.keys())
-        course_texts = [f"{courses[c].get('title','')} {courses[c].get('desc','')}" for c in course_codes]
-        if any(t.strip() for t in course_texts):
-            vectorizer = TfidfVectorizer(max_features=4000, ngram_range=(1, 2))
-            Xc = vectorizer.fit_transform(course_texts)
-            for i, c in enumerate(course_codes):
-                course_vecs[c] = Xc[i:i+1]
+    pruned_sids: List[str] = []
 
     # Process courses in consistent priority order
     ordered_codes = sorted(courses.keys(), key=lambda c: (_course_rank(courses[c].get("type","")), c))
 
-    # First pass: prune overflow
     for code in ordered_codes:
         meta = courses[code]
         raw_slots = meta.get("ta_slots", "")
         quota = _parse_int(raw_slots)
         if quota is None:
-            if str(raw_slots).strip() != "":
-                LOG.log("WARN", "TA_SLOTS_NON_NUMERIC", course=code, detail=f"value='{raw_slots}' (no cap applied)")
-            continue  # no cap enforcement
-
-        sup_list, instr_list, stud_list = _current_ta_lists(meta)
-        current = _iter_all_nonleading(meta)
-        cur_n = len(current)
-
+            quota = 0
+            LOG.log("WARN", "TA_SLOTS_NON_NUMERIC_TREATED_AS_ZERO", course=code, detail=f"value='{raw_slots}' -> cap=0")
         if quota < 0:
             quota = 0
 
-        if cur_n > quota:
-            # Keep highest priority first: supervisor -> instructor -> student.
-            keep_needed = quota
-            new_sup, new_instr, new_stud = [], [], []
-            # Fill in order
-            for name, sid, cat in current:
-                if keep_needed <= 0:
-                    break
-                if cat == "ta_supervisor" and len(new_sup) < len(sup_list):
-                    new_sup.append((name, sid)); keep_needed -= 1
-                # defer others
-            for name, sid, cat in current:
-                if keep_needed <= 0:
-                    break
-                if cat == "ta_instr_only":
-                    new_instr.append((name, sid)); keep_needed -= 1
-            for name, sid, cat in current:
-                if keep_needed <= 0:
-                    break
-                if cat == "ta_student_only":
-                    new_stud.append((name, sid)); keep_needed -= 1
+        # Flatten all TAs that count toward the cap (leading included)
+        leading = list(meta.get("leading_ta", []))
+        sup    = list(meta.get("ta_supervisor", []))
+        instr  = list(meta.get("ta_instr_only", []))
+        stud   = list(meta.get("ta_student_only", []))
 
-            # Determine removed pairs
-            kept = set(new_sup + new_instr + new_stud)
-            removed_pairs = [(name, sid) for (name, sid, _cat) in current if (name, sid) not in kept]
+        flat_all: List[Tuple[str, Optional[str], str]] = \
+            [(n,sid,"leading_ta") for (n,sid) in leading] + \
+            [(n,sid,"ta_supervisor") for (n,sid) in sup] + \
+            [(n,sid,"ta_instr_only") for (n,sid) in instr] + \
+            [(n,sid,"ta_student_only") for (n,sid) in stud]
 
-            # Apply lists
-            meta["ta_supervisor"] = new_sup
-            meta["ta_instr_only"] = new_instr
-            meta["ta_student_only"] = new_stud
+        cur_n = len(flat_all)
+        if cur_n <= quota:
+            # Under / equal to quota: nothing to prune
+            continue
 
-            # Unmatch removed students if they aren't assigned elsewhere
-            for name, sid in removed_pairs:
-                if sid is None:
+        # Keep the first `quota` items by the priority above; prune the rest
+        keep = flat_all[:quota]
+        drop = flat_all[quota:]
+
+        # Rebuild buckets from kept list
+        leading_k, sup_k, instr_k, stud_k = [], [], [], []
+        for name, sid, cat in keep:
+            if cat == "leading_ta":
+                leading_k.append((name, sid))
+            elif cat == "ta_supervisor":
+                sup_k.append((name, sid))
+            elif cat == "ta_instr_only":
+                instr_k.append((name, sid))
+            else:
+                stud_k.append((name, sid))
+
+        meta["leading_ta"]     = leading_k
+        meta["ta_supervisor"]  = sup_k
+        meta["ta_instr_only"]  = instr_k
+        meta["ta_student_only"]= stud_k
+
+        # Mark pruned students as unmatched (if not present elsewhere)
+        for name, sid, _ in drop:
+            if not sid:
+                continue
+            present_elsewhere = False
+            for c2, m2 in courses.items():
+                if c2 == code:
                     continue
-                # check if still present anywhere
-                still_assigned = False
-                for c2, m2 in courses.items():
-                    if c2 == code:
-                        continue
-                    for cat2 in ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"):
-                        if (name, sid) in m2.get(cat2, []):
-                            still_assigned = True
-                            break
-                    if still_assigned:
+                for cat2 in ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"):
+                    if (name, sid) in m2.get(cat2, []):
+                        present_elsewhere = True
                         break
-                if not still_assigned and sid in matched:
-                    matched.remove(sid)
-                LOG.log("INFO", "TA_OVERFLOW_PRUNE", course=code, student_id=(sid or ""), student_name=name,
-                        detail=f"Pruned due to cap {quota}")
-
-        elif cur_n < quota:
-            # Need to fill (from unmatched) for this course
-            need = quota - cur_n
-            course_vec = course_vecs.get(code) if vectorizer is not None else None
-            ranked = _rank_candidates_for_course(code, meta, student_map, matched, vectorizer, course_vec)
-            added = 0
-            for sid, score in ranked:
-                if added >= need:
+                if present_elsewhere:
                     break
-                s = student_map[sid]
-                pair = (s.get("name", sid), sid)
-                # Avoid duplication just in case
-                if pair in meta.get("ta_supervisor", []) or pair in meta.get("ta_instr_only", []) or pair in meta.get("ta_student_only", []):
-                    continue
-                meta["ta_student_only"].append(pair)
-                matched.add(sid)
-                added += 1
-                LOG.log("INFO", "TA_UNDERFILL_ADD", course=code, student_id=sid, student_name=pair[0],
-                        detail=f"Filled to cap via background match (score={score:.4f})")
+            if not present_elsewhere and sid in matched:
+                matched.remove(sid)
+            pruned_sids.append(sid)
+            LOG.log("INFO", "TA_OVERFLOW_PRUNE", course=code, student_id=sid, student_name=name,
+                    detail=f"Pruned due to cap {quota}")
 
-            # If still short (e.g., no background text), do a very light final sweep by any unmatched
-            if added < need:
-                for sid, s in student_map.items():
-                    if added >= need:
-                        break
-                    if sid in matched:
-                        continue
-                    pair = (s.get("name", sid), sid)
-                    meta["ta_student_only"].append(pair)
-                    matched.add(sid)
-                    added += 1
-                    LOG.log("INFO", "TA_UNDERFILL_ADD", course=code, student_id=sid, student_name=pair[0],
-                            detail="Filled to cap via fallback (no background/prefs)")
+    return pruned_sids
 
-    # Done: per-course caps enforced
+def _count_assigned_including_leading(meta: dict) -> int:
+    return sum(len(meta.get(k, [])) for k in ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"))
+
+def iterative_match_until_stable(
+    courses_assign: Dict[str, dict],
+    student_map: Dict[str, dict],
+    matched_sids: set[str],
+    max_passes: int = 12
+) -> None:
+    """
+    Make matching globally exhaustive: whenever caps prune students,
+    rematch them into remaining capacity, looping until stable.
+    Uses existing `semantic_and_fallback_fill` and `enforce_ta_caps`.
+    """
+    prev_unmatched = None
+
+    for _ in range(max_passes):
+        # 1) ensure current state honors caps (may prune)
+        enforce_ta_caps(courses_assign, student_map, matched_sids)
+
+        # 2) fill any unmatched students into remaining capacity
+        semantic_and_fallback_fill(courses_assign, student_map, matched_sids)
+
+        # 3) re-enforce caps in case fill overshot any course
+        enforce_ta_caps(courses_assign, student_map, matched_sids)
+
+        # 4) check convergence / capacity
+        cur_unmatched = _unmatched_count(student_map, matched_sids)
+        open_slots = _total_open_slots(courses_assign)
+
+        # Done if everyone placed or no capacity left anywhere
+        if cur_unmatched == 0 or open_slots == 0:
+            break
+
+        # Stop if no improvement over last pass (stable)
+        if prev_unmatched is not None and cur_unmatched >= prev_unmatched:
+            break
+
+        prev_unmatched = cur_unmatched
+
 
 
 # ======================================================================
@@ -865,46 +848,78 @@ def enforce_ta_caps(courses: Dict[str, dict], student_map: Dict[str, dict], matc
 # ======================================================================
 
 def build_assignment_dataframe(courses: Dict[str, dict], id_to_profile: Dict[str, dict]) -> pd.DataFrame:
-    """Emit Teaching Assignment-like table with CHN names + ENG + Email."""
+    """
+    Emit Teaching Assignment-like table with **one TA per row**.
+    Leading TAs also appear in the "TA Name" column and count toward capacity.
+    """
+    def resolve_one(pair: Tuple[str, Optional[str]]) -> Tuple[str, str, str]:
+        name, sid = pair
+        if sid and sid in id_to_profile:
+            prof = id_to_profile[sid]
+            zh = prof.get("name_zh") or name
+            en = prof.get("name_en") or name
+            em = prof.get("email") or ""
+            return zh, en, em
+        return name, name, ""
+
     rows = []
     for code, m in courses.items():
-        ta_pairs = m.get("ta_supervisor", []) + m.get("ta_instr_only", []) + m.get("ta_student_only", [])
-        leading_pairs = m.get("leading_ta", [])
-        ustf_pairs = m.get("ustf_instr", []) + m.get("ustf_ta", [])
+        # All TAs that count: leading + normal buckets (order preserved by priority)
+        pairs_leading = list(m.get("leading_ta", []))
+        pairs_keep    = list(m.get("ta_supervisor", [])) + list(m.get("ta_instr_only", [])) + list(m.get("ta_student_only", []))
 
-        def resolve(pairs: List[Tuple[str, Optional[str]]]):
-            zh, en, em = [], [], []
-            for name, sid in pairs:
-                if sid and sid in id_to_profile:
-                    prof = id_to_profile[sid]
-                    zh.append(prof.get("name_zh") or name)
-                    en.append(prof.get("name_en") or name)
-                    em.append(prof.get("email") or "")
-                else:
-                    zh.append(name)
-                    en.append(name)
-                    em.append("")
-            return ", ".join(x for x in zh if x), ", ".join(x for x in en if x), ", ".join(x for x in em if x)
+        # USTF (kept as aggregated columns; unchanged by this request)
+        ustf_pairs = list(m.get("ustf_instr", [])) + list(m.get("ustf_ta", []))
+        ustf_zh = []
+        ustf_en = []
+        ustf_em = []
+        for p in ustf_pairs:
+            zh, en, em = resolve_one(p)
+            ustf_zh.append(zh); ustf_en.append(en); ustf_em.append(em)
+        ustf_zh_s = ", ".join([x for x in ustf_zh if x])
+        ustf_en_s = ", ".join([x for x in ustf_en if x])
+        ustf_em_s = ", ".join([x for x in ustf_em if x])
 
-        ta_zh, ta_en, ta_em = resolve(ta_pairs)
-        lead_zh, lead_en, lead_em = resolve(leading_pairs)
-        ustf_zh, ustf_en, ustf_em = resolve(ustf_pairs)
+        # Emit one row per TA (leading first)
+        for is_leading, plist in [(True, pairs_leading), (False, pairs_keep)]:
+            for pair in plist:
+                zh, en, em = resolve_one(pair)
+                rows.append({
+                    "Course Type": m.get("type", ""),
+                    "Course Code": code,
+                    "Course Title": m.get("title", ""),
+                    "Course Instructors": ", ".join(m.get("instructors_raw", [])),
+                    # TA per row
+                    "TA Name": zh,                  # Chinese
+                    "Leading TA": zh if is_leading else "",  # keep this column; filled only for leading rows
+                    "TA ENG Name": en,
+                    "TA Email": em,
+                    # USTF (still aggregated for the course)
+                    "USTF Name": ustf_zh_s,
+                    "USTF ENG Name": ustf_en_s,
+                    "USTF Email": ustf_em_s,
+                    "Comments (TA)": ". ".join(m.get("ta_comments", [])),
+                    "Comments (Instructor)": m.get("instr_comments", ""),
+                })
 
-        rows.append({
-            "Course Type": m.get("type", ""),
-            "Course Code": code,
-            "Course Title": m.get("title", ""),
-            "Course Instructors": ", ".join(m.get("instructors_raw", [])),
-            "TA Name": ta_zh,                      # Chinese
-            "Leading TA": lead_zh,                 # Chinese
-            "TA ENG Name": ", ".join([x for x in [lead_en, ta_en] if x]).strip(", "),
-            "TA Email": ", ".join([x for x in [lead_em, ta_em] if x]).strip(", "),
-            "USTF Name": ustf_zh,
-            "USTF ENG Name": ustf_en,
-            "USTF Email": ustf_em,
-            "Comments (TA)": ". ".join(m.get("ta_comments", [])),
-            "Comments (Instructor)": m.get("instr_comments", ""),
-        })
+        # If no TA at all, still emit one placeholder row (optional; mirrors old behavior)
+        if not pairs_leading and not pairs_keep:
+            rows.append({
+                "Course Type": m.get("type", ""),
+                "Course Code": code,
+                "Course Title": m.get("title", ""),
+                "Course Instructors": ", ".join(m.get("instructors_raw", [])),
+                "TA Name": "",
+                "Leading TA": "",
+                "TA ENG Name": "",
+                "TA Email": "",
+                "USTF Name": ustf_zh_s,
+                "USTF ENG Name": ustf_en_s,
+                "USTF Email": ustf_em_s,
+                "Comments (TA)": ". ".join(m.get("ta_comments", [])),
+                "Comments (Instructor)": m.get("instr_comments", ""),
+            })
+
     df = pd.DataFrame(rows)
     preferred = [
         "Course Type","Course Code","Course Title","Course Instructors",
@@ -1004,14 +1019,11 @@ if assign_file and namelist_file and instr_file and stud_file:
     # Merge student map & comprehensive name->id dictionary
     student_map, name_to_id = build_student_map(id_to_profile, stud_pref_map)
 
-    # Revised matching
+    # Revised matching (initial pass)
     matched_sids = perform_matching(courses_instr, courses_assign, student_map, name_to_id)
 
-    # Guaranteed completion: semantic + fallbacks
-    semantic_and_fallback_fill(courses_assign, student_map, matched_sids)
-
-    # NEW: Enforce strict TA caps per course from Teaching Assignment
-    enforce_ta_caps(courses_assign, student_map, matched_sids)
+    # Iteratively rematch until stable: prune → fill → prune, repeat
+    iterative_match_until_stable(courses_assign, student_map, matched_sids)
 
     # Build outputs
     assign_df_out = build_assignment_dataframe(courses_assign, id_to_profile)
@@ -1123,6 +1135,7 @@ if assign_file and namelist_file and instr_file and stud_file:
 
                     st.success("Update applied ✔️")
                 # Rebuild previews
+                iterative_match_until_stable(st.session_state.courses, st.session_state.student_map, st.session_state.matched)
                 st.session_state.assign_df = build_assignment_dataframe(
                     st.session_state.courses, st.session_state.id_to_profile
                 )
