@@ -57,6 +57,9 @@ LOG = RunLogger()
 # Generic helpers
 # ======================================================================
 
+def _uploaded_name(obj) -> str:
+    return getattr(obj, "name", "uploaded")
+
 def _read_main_or_first(uploaded_file, prefer: List[str] | None = None) -> pd.DataFrame:
     """Prefer a named sheet (by exact or substring), else 'main', else first sheet."""
     xl = pd.ExcelFile(uploaded_file)
@@ -65,16 +68,22 @@ def _read_main_or_first(uploaded_file, prefer: List[str] | None = None) -> pd.Da
         for want in prefer:
             for s in sheet_names:
                 if s == want or want.lower() in s.lower():
-                    LOG.log("INFO", "SHEET_SELECTED", detail=f"{uploaded_file.name} -> {s}")
+                    LOG.log("INFO", "SHEET_SELECTED", detail=f"{_uploaded_name(uploaded_file)} -> {s}")
                     return xl.parse(sheet_name=s)
     name_map = {s.lower(): s for s in sheet_names}
     target_sheet = name_map.get("main", sheet_names[0])
-    LOG.log("INFO", "SHEET_SELECTED", detail=f"{uploaded_file.name} -> {target_sheet}")
+    LOG.log("INFO", "SHEET_SELECTED", detail=f"{_uploaded_name(uploaded_file)} -> {target_sheet}")
     return xl.parse(sheet_name=target_sheet)
 
-
 def _normalize_header(h: str) -> str:
-    return re.sub(r"\s+", " ", str(h).strip().lower())
+    """
+    Lowercase, collapse whitespace, and strip punctuation for resilient matching.
+    Makes 'Course instructor's name' ~ 'course instructors name' ~ 'Course instructor's name'.
+    """
+    s = re.sub(r"\s+", " ", str(h).strip().lower())
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def _find_col(df: pd.DataFrame, substr: str,
               prefer_exact: bool = True,
@@ -87,7 +96,7 @@ def _find_col(df: pd.DataFrame, substr: str,
     cols = [(c, _normalize_header(c)) for c in df.columns]
 
     def allowed(orig: str, norm: str) -> bool:
-        lo = orig.lower()
+        lo = str(orig).lower()
         if any(lo.startswith(p) for p in disallow_prefixes):
             return False
         if exclude_contains and any(tok.lower() in lo for tok in exclude_contains):
@@ -103,7 +112,6 @@ def _find_col(df: pd.DataFrame, substr: str,
             return orig
     return None
 
-
 def _get_id(raw_id: str | float | int) -> str:
     """Convert raw student ID to a string, removing trailing .0."""
     if pd.isna(raw_id):
@@ -111,7 +119,6 @@ def _get_id(raw_id: str | float | int) -> str:
     if isinstance(raw_id, float) and float(raw_id).is_integer():
         return str(int(raw_id))
     return str(raw_id).strip()
-
 
 def _canonicalize_name(raw: str | float | int) -> str | None:
     """Canonical EN name 'Firstname LASTNAME'. Returns None if 'None.' or empty."""
@@ -145,7 +152,6 @@ def _normalize_delimiters(s: str) -> str:
         return s
     s = (s.replace("、", ",")
            .replace("，", ",")
-           .replace("；", ",")
            .replace("；", ",")
            .replace("．", ".")
            .replace("：", ":"))
@@ -188,7 +194,6 @@ def _parse_instructor_pref_cell(cell: str | float | int) -> Tuple[List[str], str
         return [], s[5:].strip()
     return _parse_name_list(s), ""
 
-
 def _clean_token(s: str | float | int) -> str:
     if pd.isna(s):
         return ""
@@ -197,7 +202,6 @@ def _clean_token(s: str | float | int) -> str:
     s = re.sub(r"[()（）•·，、]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
 
 def _split_instructors(raw: str | float | int) -> List[str]:
     if pd.isna(raw):
@@ -214,14 +218,11 @@ def _split_instructors(raw: str | float | int) -> List[str]:
                 parts.append(p)
     return list(dict.fromkeys(parts))
 
-
 def _canon_eng_name(s: str | float | int) -> str:
     return _canonicalize_name(s) or ""
 
-
 def _canon_chn_name(s: str | float | int) -> str:
     return _clean_token(s)
-
 
 def _parse_int(val) -> Optional[int]:
     """Return int if val is numeric, rounding decimals to nearest integer; else None."""
@@ -233,6 +234,8 @@ def _parse_int(val) -> Optional[int]:
     except (ValueError, TypeError):
         return None
 
+def _count_assigned_including_leading(meta: dict) -> int:
+    return sum(len(meta.get(k, [])) for k in ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"))
 
 def _quota_remaining(meta: dict) -> int:
     """Remaining slots for this course (leading + all TA buckets count)."""
@@ -254,7 +257,6 @@ def _eligible_codes_by_priority(courses: Dict[str, dict], rem: Dict[str, int]) -
     )
 
 
-
 # ======================================================================
 # Loaders
 # ======================================================================
@@ -262,7 +264,7 @@ def _eligible_codes_by_priority(courses: Dict[str, dict], rem: Dict[str, int]) -
 def load_teaching_assignment(df: pd.DataFrame) -> Dict[str, dict]:
     code_col = _find_col(df, "Course Code")
     title_col = _find_col(df, "Course Title") or _find_col(df, "Course Description")
-    desc_col = _find_col(df, "Course Description") or _find_col(df, "Course Description(ENG)")
+    desc_col = _find_col(df, "Course Description(ENG)") or _find_col(df, "Course Description")
     inst_col = _find_col(df, "Course Instructors")
     type_col = _find_col(df, "Course Type")
     ta_num_col = _find_col(df, "TA number") or _find_col(df, "TA Number")
@@ -298,7 +300,6 @@ def load_teaching_assignment(df: pd.DataFrame) -> Dict[str, dict]:
     LOG.log("INFO", "COURSE_COUNT", detail=str(len(courses)))
     return courses
 
-
 def load_ta_name_list(df: pd.DataFrame):
     """
     From the TA Name List file.
@@ -308,20 +309,16 @@ def load_ta_name_list(df: pd.DataFrame):
         }
       - name_to_id: both EN canonical + CN name -> sid
     """
-    zh_col = _find_col(df, "Name", prefer_exact=True, disallow_prefixes=("unnamed:",))
-    if zh_col is None:
-        zh_col = _find_col(df, "姓名", prefer_exact=True, disallow_prefixes=("unnamed:",))
-
+    zh_col = _find_col(df, "Name", prefer_exact=True, disallow_prefixes=("unnamed:",)) or \
+             _find_col(df, "姓名", prefer_exact=True, disallow_prefixes=("unnamed:",))
     en_col = _find_col(df, "English Name", prefer_exact=True)
     sid_col = _find_col(df, "ID", prefer_exact=True) or _find_col(df, "Student ID", prefer_exact=True)
     email_col = _find_col(df, "Email", prefer_exact=False)
     cohort_col = _find_col(df, "Cohort", prefer_exact=True)
     major_col = _find_col(df, "Major/Fields", prefer_exact=True)
-
-    sup_zh_col = _find_col(df, "Main Supervisor（CHI）", prefer_exact=True)
+    sup_zh_col = _find_col(df, "Main Supervisor（CHI）", prefer_exact=True) or _find_col(df, "Main Supervisor (CHI)", prefer_exact=True)
     sup_en_col = _find_col(df, "Main Supervisor", prefer_exact=True,
-                           exclude_contains=("（chi", "(chi"))
-
+                           exclude_contains=("（chi", "(chi", "chi）", "chi)"))
     field_col = _find_col(df, "官网Research Field", prefer_exact=False) or _find_col(df, "Research Field", prefer_exact=False)
 
     LOG.log("INFO", "NAME_LIST_COLUMNS",
@@ -366,10 +363,9 @@ def load_ta_name_list(df: pd.DataFrame):
     LOG.log("INFO", "TA_NAME_LIST_SIZE", detail=str(len(id_to_profile)))
     return id_to_profile, name_to_id
 
-
 def load_instructor_sheet(df: pd.DataFrame) -> Dict[str, dict]:
     course_code_col = _find_col(df, "Course code") or _find_col(df, "Course Code")
-    instructor_col = _find_col(df, "Course instructor") or _find_col(df, "Course instructor's name")
+    instructor_col = _find_col(df, "Course instructor") or _find_col(df, "Course instructor's name") or _find_col(df, "Course instructors name")
     pref_ta_col = _find_col(df, "Instructor preference for corresponding TA")
     pref_lead_col = _find_col(df, "Instructor preference for Leading TA")
     ustf_col = _find_col(df, "USTF Number Needed") or _find_col(df, "USTF")
@@ -383,7 +379,7 @@ def load_instructor_sheet(df: pd.DataFrame) -> Dict[str, dict]:
         pref_names, req_comment = _parse_instructor_pref_cell(row[pref_ta_col] if pref_ta_col else "")
         lead_names, _ = _parse_instructor_pref_cell(row[pref_lead_col] if pref_lead_col else "")
         pref_names = [name for name in pref_names if name not in lead_names]
-        # USTF
+        # USTF parsing: numbers in [a,b], names inside (...)
         m = re.search(r"\[(\d+)\s*,\s*(\d+)\]", str(row[ustf_col])) if ustf_col else None
         names_part = re.search(r"\((.*?)\)", str(row[ustf_col])) if ustf_col else None
         ustf_names = _parse_name_list(names_part.group(1)) if names_part else []
@@ -417,9 +413,9 @@ def load_instructor_sheet(df: pd.DataFrame) -> Dict[str, dict]:
     LOG.log("INFO", "INSTR_PREF_COURSE_COUNT", detail=str(len(courses)))
     return courses
 
-
 def load_student_prefs(df: pd.DataFrame) -> Dict[str, dict]:
-    name_col = _find_col(df, "Full Name") or _find_col(df, "Normalized Name")
+    # name_col is optional here (used only for debug / expansion)
+    _ = _find_col(df, "Full Name") or _find_col(df, "Normalized Name")
     sid_col  = _find_col(df, "Student ID")
     other_col = _find_col(df, "Other information")
     ustf_col = _find_col(df, "USTF Remark")
@@ -449,7 +445,6 @@ def load_student_prefs(df: pd.DataFrame) -> Dict[str, dict]:
         out[sid] = {"prefs": prefs, "ustf_remark": ustf_remark, "other": other}
     LOG.log("INFO", "STUDENT_PREF_COUNT", detail=str(len(out)))
     return out
-
 
 def build_student_map(id_to_profile: Dict[str, dict], pref_map: Dict[str, dict]):
     student_map: Dict[str, dict] = {}
@@ -496,7 +491,6 @@ def _course_rank(t: str) -> int:
         return 2
     return 3
 
-
 def perform_matching(courses_from_instr: Dict[str, dict],
                      courses_from_assign: Dict[str, dict],
                      student_map: Dict[str, dict],
@@ -527,7 +521,7 @@ def perform_matching(courses_from_instr: Dict[str, dict],
             meta["_lead_names"] = []
             meta.setdefault("instr_comments", "")
 
-    # Leading TA
+    # Leading TA (reserve by name if resolvable)
     for code, meta in courses.items():
         leading_pairs: List[Tuple[str, Optional[str]]] = []
         for lead in meta.get("_lead_names", []):
@@ -540,7 +534,7 @@ def perform_matching(courses_from_instr: Dict[str, dict],
                 LOG.log("WARN", "LEADING_TA_NO_ID", course=code, student_name=lead)
         meta["leading_ta"] = leading_pairs
 
-    # (1) Supervisor preference (instructor prefers X and X's supervisor is among instructors)
+    # (1) Supervisor preference
     for code, meta in courses.items():
         inst_set = meta.get("instructors_set", set())
         for pref_name in meta.get("_pref_names", []):
@@ -589,6 +583,7 @@ def perform_matching(courses_from_instr: Dict[str, dict],
 # ======================================================================
 # Semantic & fallbacks (guaranteed completion)
 # ======================================================================
+
 def _semantic_assign_unmatched(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
     """TF-IDF cosine(student background vs course text), respecting remaining capacity."""
     if not _HAS_SKLEARN:
@@ -596,8 +591,8 @@ def _semantic_assign_unmatched(courses: Dict[str, dict], student_map: Dict[str, 
         return
 
     course_codes = list(courses.keys())
-    course_texts = [f"{courses[c].get('title','')} {courses[c].get('desc','')}" for c in course_codes]
-    if not any(t.strip() for t in course_texts):
+    course_texts = [f"{courses[c].get('title','')} {courses[c].get('desc','')}".strip() for c in course_codes]
+    if not any(t for t in course_texts):
         LOG.log("WARN", "SEMANTIC_SKIPPED", detail="Course texts are empty")
         return
 
@@ -614,8 +609,8 @@ def _semantic_assign_unmatched(courses: Dict[str, dict], student_map: Dict[str, 
         if not elig:
             break
         stxt = " ".join(filter(None, [s.get("major",""), s.get("field",""),
-                                      s.get("supervisor_en",""), s.get("supervisor_zh","")]))
-        if not stxt.strip():
+                                      s.get("supervisor_en",""), s.get("supervisor_zh","")])).strip()
+        if not stxt:
             LOG.log("WARN", "NO_BACKGROUND_TEXT", student_id=sid, student_name=s.get("name",""))
             continue
         xs = vectorizer.transform([stxt])
@@ -691,7 +686,6 @@ def _balanced_fill_any_remaining(courses: Dict[str, dict], student_map: Dict[str
             LOG.log("INFO", "MATCH", course=best_code, student_id=sid,
                     student_name=s.get("name",""),
                     detail="Balanced final assignment")
-
 
 def semantic_and_fallback_fill(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
     _semantic_assign_unmatched(courses, student_map, matched)
@@ -801,9 +795,6 @@ def enforce_ta_caps(courses: Dict[str, dict], student_map: Dict[str, dict], matc
 
     return pruned_sids
 
-def _count_assigned_including_leading(meta: dict) -> int:
-    return sum(len(meta.get(k, [])) for k in ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"))
-
 def iterative_match_until_stable(
     courses_assign: Dict[str, dict],
     student_map: Dict[str, dict],
@@ -842,15 +833,17 @@ def iterative_match_until_stable(
         prev_unmatched = cur_unmatched
 
 
-
 # ======================================================================
 # Output builders
 # ======================================================================
 
-def build_assignment_dataframe(courses: Dict[str, dict], id_to_profile: Dict[str, dict]) -> pd.DataFrame:
+def build_assignment_dataframe(courses: Dict[str, dict],
+                               id_to_profile: Dict[str, dict],
+                               original_assign_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Emit Teaching Assignment-like table with **one TA per row**.
-    Leading TAs also appear in the "TA Name" column and count toward capacity.
+    Build final assignment dataframe, preserving ALL columns from the uploaded Teaching Assignment.
+    One TA per row, duplicating original row data only on the FIRST row for each course;
+    subsequent rows leave original columns blank to avoid repetition.
     """
     def resolve_one(pair: Tuple[str, Optional[str]]) -> Tuple[str, str, str]:
         name, sid = pair
@@ -862,73 +855,94 @@ def build_assignment_dataframe(courses: Dict[str, dict], id_to_profile: Dict[str
             return zh, en, em
         return name, name, ""
 
+    # Locate Course Code column to align rows
+    code_col = _find_col(original_assign_df, "Course Code")
+    if not code_col:
+        raise ValueError("Course Code column not found in original Teaching Assignment file.")
+
+    # TA-related columns we add/modify (not part of 'original columns' dedup rule)
+    ta_cols = [
+        "TA Name", "Leading TA", "TA ENG Name", "TA Email",
+        "USTF Name", "USTF ENG Name", "USTF Email",
+        "Comments (TA)", "Comments (Instructor)"
+    ]
+
     rows = []
-    for code, m in courses.items():
-        # All TAs that count: leading + normal buckets (order preserved by priority)
+    for _, orig_row in original_assign_df.iterrows():
+        code = str(orig_row[code_col]).replace(" ", "").strip()
+        if code not in courses:
+            continue
+
+        m = courses[code]
         pairs_leading = list(m.get("leading_ta", []))
-        pairs_keep    = list(m.get("ta_supervisor", [])) + list(m.get("ta_instr_only", [])) + list(m.get("ta_student_only", []))
+        pairs_keep = list(m.get("ta_supervisor", [])) + list(m.get("ta_instr_only", [])) + list(m.get("ta_student_only", []))
 
-        # USTF (kept as aggregated columns; unchanged by this request)
+        # Precompute aggregated USTF text once per course
         ustf_pairs = list(m.get("ustf_instr", [])) + list(m.get("ustf_ta", []))
-        ustf_zh = []
-        ustf_en = []
-        ustf_em = []
+        ustf_zh_list, ustf_en_list, ustf_em_list = [], [], []
         for p in ustf_pairs:
-            zh, en, em = resolve_one(p)
-            ustf_zh.append(zh); ustf_en.append(en); ustf_em.append(em)
-        ustf_zh_s = ", ".join([x for x in ustf_zh if x])
-        ustf_en_s = ", ".join([x for x in ustf_en if x])
-        ustf_em_s = ", ".join([x for x in ustf_em if x])
+            zh_u, en_u, em_u = resolve_one(p)
+            ustf_zh_list.append(zh_u); ustf_en_list.append(en_u); ustf_em_list.append(em_u)
+        ustf_zh = ", ".join(filter(None, ustf_zh_list))
+        ustf_en = ", ".join(filter(None, ustf_en_list))
+        ustf_em = ", ".join(filter(None, ustf_em_list))
 
-        # Emit one row per TA (leading first)
+        made_any_row = False
+        is_first_for_course = True
+
+        # Helper to create a row, blanking original columns if not first
+        def make_row(is_leading_flag: bool, pair: Tuple[str, Optional[str]] | None):
+            nonlocal is_first_for_course, made_any_row
+            new_row = orig_row.copy()
+
+            # If not the first row for this course, blank original columns to avoid repetition
+            if not is_first_for_course:
+                for col in original_assign_df.columns:
+                    new_row[col] = ""
+
+            if pair is None:
+                # No TA case for this course
+                new_row["TA Name"] = ""
+                new_row["Leading TA"] = ""
+                new_row["TA ENG Name"] = ""
+                new_row["TA Email"] = ""
+            else:
+                zh, en, em = resolve_one(pair)
+                new_row["TA Name"] = zh
+                new_row["Leading TA"] = zh if is_leading_flag else ""
+                new_row["TA ENG Name"] = en
+                new_row["TA Email"] = em
+
+            # Always fill (course-level) aggregated/derived columns
+            new_row["USTF Name"] = ustf_zh
+            new_row["USTF ENG Name"] = ustf_en
+            new_row["USTF Email"] = ustf_em
+            new_row["Comments (TA)"] = ". ".join(m.get("ta_comments", []))
+            new_row["Comments (Instructor)"] = m.get("instr_comments", "")
+
+            rows.append(new_row)
+            made_any_row = True
+            is_first_for_course = False
+
+        # Emit rows: leading TAs first, then other TAs
         for is_leading, plist in [(True, pairs_leading), (False, pairs_keep)]:
             for pair in plist:
-                zh, en, em = resolve_one(pair)
-                rows.append({
-                    "Course Type": m.get("type", ""),
-                    "Course Code": code,
-                    "Course Title": m.get("title", ""),
-                    "Course Instructors": ", ".join(m.get("instructors_raw", [])),
-                    # TA per row
-                    "TA Name": zh,                  # Chinese
-                    "Leading TA": zh if is_leading else "",  # keep this column; filled only for leading rows
-                    "TA ENG Name": en,
-                    "TA Email": em,
-                    # USTF (still aggregated for the course)
-                    "USTF Name": ustf_zh_s,
-                    "USTF ENG Name": ustf_en_s,
-                    "USTF Email": ustf_em_s,
-                    "Comments (TA)": ". ".join(m.get("ta_comments", [])),
-                    "Comments (Instructor)": m.get("instr_comments", ""),
-                })
+                make_row(is_leading, pair)
 
-        # If no TA at all, still emit one placeholder row (optional; mirrors old behavior)
-        if not pairs_leading and not pairs_keep:
-            rows.append({
-                "Course Type": m.get("type", ""),
-                "Course Code": code,
-                "Course Title": m.get("title", ""),
-                "Course Instructors": ", ".join(m.get("instructors_raw", [])),
-                "TA Name": "",
-                "Leading TA": "",
-                "TA ENG Name": "",
-                "TA Email": "",
-                "USTF Name": ustf_zh_s,
-                "USTF ENG Name": ustf_en_s,
-                "USTF Email": ustf_em_s,
-                "Comments (TA)": ". ".join(m.get("ta_comments", [])),
-                "Comments (Instructor)": m.get("instr_comments", ""),
-            })
+        # If no TA at all, still emit one placeholder row
+        if not made_any_row:
+            make_row(False, None)
 
-    df = pd.DataFrame(rows)
-    preferred = [
-        "Course Type","Course Code","Course Title","Course Instructors",
-        "TA Name","Leading TA","TA ENG Name","TA Email",
-        "USTF Name","USTF ENG Name","USTF Email",
-        "Comments (TA)","Comments (Instructor)"
-    ]
-    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
-    return df[cols]
+    final_df = pd.DataFrame(rows)
+
+    # Ensure TA-related columns exist even if empty
+    for col in ta_cols:
+        if col not in final_df.columns:
+            final_df[col] = ""
+
+    # Preserve original column order; append any new columns at the end
+    col_order = list(original_assign_df.columns) + [c for c in ta_cols if c not in original_assign_df.columns]
+    return final_df[col_order]
 
 
 def build_unmatched_dataframe(student_map: Dict[str, dict], matched: set[str]) -> pd.DataFrame:
@@ -1026,7 +1040,7 @@ if assign_file and namelist_file and instr_file and stud_file:
     iterative_match_until_stable(courses_assign, student_map, matched_sids)
 
     # Build outputs
-    assign_df_out = build_assignment_dataframe(courses_assign, id_to_profile)
+    assign_df_out = build_assignment_dataframe(courses_assign, id_to_profile, assign_df)
     unmatched_df  = build_unmatched_dataframe(student_map, matched_sids)
 
     # Session state
@@ -1059,7 +1073,7 @@ if assign_file and namelist_file and instr_file and stud_file:
             go = st.button("Apply change")
 
         if go and course_sel and student_id_sel:
-            success = False
+            changed = False
             course_sel = course_sel.replace(" ", "").strip()
             if course_sel not in st.session_state.courses:
                 st.error("Unknown course code.")
@@ -1073,24 +1087,24 @@ if assign_file and namelist_file and instr_file and stud_file:
                 c_meta = st.session_state.courses[course_sel]
 
                 if action == "Add":
-                    present_anywhere = any(
+                    present_in_course = any(
                         name_pair in c_meta.get(cat, [])
                         for cat in ("leading_ta", "ta_supervisor", "ta_instr_only", "ta_student_only", "ustf_instr", "ustf_ta")
                     )
                     if role == "Normal TA":
-                        if not present_anywhere:
+                        if not present_in_course:
                             c_meta["ta_instr_only"].append(name_pair)
                             st.session_state.matched.add(student_id_sel)
-                            success = True
+                            changed = True
                             LOG.log("INFO", "MANUAL_MATCH", course=course_sel, student_id=student_id_sel,
                                     student_name=s_info["name"], detail="Manual add: Normal TA")
                         else:
                             st.warning("Student already listed for this course.")
                     elif role == "Leading TA":
-                        if not present_anywhere:
+                        if not present_in_course:
                             c_meta.setdefault("leading_ta", []).append(name_pair)
                             st.session_state.matched.add(student_id_sel)
-                            success = True
+                            changed = True
                             LOG.log("INFO", "MANUAL_MATCH", course=course_sel, student_id=student_id_sel,
                                     student_name=s_info["name"], detail="Manual add: Leading TA")
                         else:
@@ -1102,7 +1116,7 @@ if assign_file and namelist_file and instr_file and stud_file:
                         if ustf_name not in ustf_name_list:
                             c_meta.setdefault("ustf_instr", []).append(name_pair)
                             st.session_state.matched.add(student_id_sel)
-                            success = True
+                            changed = True
                             LOG.log("INFO", "MANUAL_MATCH", course=course_sel, student_id=student_id_sel,
                                     student_name=s_info["name"], detail="Manual add: USTF")
                         else:
@@ -1113,37 +1127,39 @@ if assign_file and namelist_file and instr_file and stud_file:
                         if name_pair in c_meta.get(cat, []):
                             c_meta[cat].remove(name_pair)
                             removed = True
-                            success = True
+                            changed = True
                             LOG.log("INFO", "MANUAL_REMOVE", course=course_sel, student_id=student_id_sel,
                                     student_name=s_info["name"], detail=f"Removed from {cat}")
                     if not removed:
                         st.warning("Student not found in this course.")
 
-                    # If no longer assigned anywhere, mark as unmatched (UI only; final fill happens on rerun)
+                    # If no longer assigned anywhere (including USTF), mark as unmatched
                     still_assigned = any(
-                        name_pair in m[cat]
+                        name_pair in m.get(cat, [])
                         for m in st.session_state.courses.values()
-                        for cat in ("leading_ta", "ta_supervisor", "ta_instr_only", "ta_student_only")
+                        for cat in ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only","ustf_instr","ustf_ta")
                     )
                     if not still_assigned and student_id_sel in st.session_state.matched:
                         st.session_state.matched.remove(student_id_sel)
                         LOG.log("INFO", "MANUAL_MARK_UNMATCHED", student_id=student_id_sel, student_name=s_info["name"])
 
-                if success:
+                if changed:
                     # After any manual change, re‑enforce caps for consistency
                     enforce_ta_caps(st.session_state.courses, st.session_state.student_map, st.session_state.matched)
 
+                    # Rebuild via iterative fill until stable
+                    iterative_match_until_stable(st.session_state.courses, st.session_state.student_map, st.session_state.matched)
+                    st.session_state.assign_df = build_assignment_dataframe(
+                        st.session_state.courses, st.session_state.id_to_profile
+                    )
+                    st.session_state.unmatched_df = build_unmatched_dataframe(
+                        st.session_state.student_map, st.session_state.matched
+                    )
                     st.success("Update applied ✔️")
-                # Rebuild previews
-                iterative_match_until_stable(st.session_state.courses, st.session_state.student_map, st.session_state.matched)
-                st.session_state.assign_df = build_assignment_dataframe(
-                    st.session_state.courses, st.session_state.id_to_profile
-                )
-                st.session_state.unmatched_df = build_unmatched_dataframe(
-                    st.session_state.student_map, st.session_state.matched
-                )
-                time.sleep(0.2)
-                st.rerun()
+                    time.sleep(0.2)
+                    st.rerun()
+                else:
+                    st.info("No changes applied.")
 
     # Downloads: assignment + unmatched + log
     st.subheader("⬇️ Downloads")
