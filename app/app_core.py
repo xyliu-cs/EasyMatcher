@@ -25,6 +25,7 @@ try:
 except Exception:
     _HAS_SKLEARN = False
 
+from openpyxl.styles import Alignment
 
 # ======================================================================
 # Logging helper
@@ -256,6 +257,43 @@ def _eligible_codes_by_priority(courses: Dict[str, dict], rem: Dict[str, int]) -
         key=lambda c: (_course_rank(courses[c].get("type", "")), c)
     )
 
+def _merge_common_columns_in_excel(ws, df: pd.DataFrame, code_col_name: str, columns_to_merge: list[str]):
+    """
+    Merge identical/common columns per course block in the Excel sheet `ws`.
+    Assumes df has rows repeated per Course Code (first row has values, following are blank).
+    """
+    if code_col_name not in df.columns:
+        return
+
+    # Map column name -> 1-based Excel column index
+    col_idx = {c: (df.columns.get_loc(c) + 1) for c in df.columns}
+
+    # Walk the dataframe to find contiguous blocks (by Course Code)
+    n = len(df)
+    i = 0
+    while i < n:
+        code = str(df.iloc[i][code_col_name])
+        # empty code rows: just advance
+        if not code:
+            i += 1
+            continue
+
+        # find the end of this contiguous course block
+        j = i + 1
+        while j < n and str(df.iloc[j][code_col_name]) == "":
+            j += 1
+
+        # Merge each "original" column across [i..j-1] if block length > 1
+        if j - i > 1:
+            start_row = i + 2  # +1 header row, +1 to convert 0-index to 1-index
+            end_row   = j + 1
+            for col in columns_to_merge:
+                if col not in col_idx:
+                    continue
+                c = col_idx[col]
+                ws.merge_cells(start_row=start_row, start_column=c, end_row=end_row, end_column=c)
+                ws.cell(row=start_row, column=c).alignment = Alignment(vertical="center")
+        i = j
 
 # ======================================================================
 # Loaders
@@ -1045,13 +1083,13 @@ if assign_file and namelist_file and instr_file and stud_file:
 
     # Session state
     st.session_state.assign_df = assign_df_out
+    st.session_state.original_assign_cols = list(assign_df.columns)
     st.session_state.unmatched_df = unmatched_df
     st.session_state.courses = courses_assign
     st.session_state.student_map = student_map
     st.session_state.matched = matched_sids
     st.session_state.id_to_profile = id_to_profile
     st.session_state.name_to_id = name_to_id
-
     # Previews
     st.subheader("📑 Preview — Course Assignments (Teaching Assignment format)")
     st.dataframe(st.session_state.assign_df, use_container_width=True, height=420)
@@ -1165,8 +1203,35 @@ if assign_file and namelist_file and instr_file and stud_file:
     st.subheader("⬇️ Downloads")
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        # Write sheets
         st.session_state.assign_df.to_excel(writer, index=False, sheet_name="UG+PG")
         st.session_state.unmatched_df.to_excel(writer, index=False, sheet_name="Unmatched")
+
+        # --- NEW ⬇ merge common columns per course in the UG+PG sheet
+        try:
+            wb = writer.book
+            ws = writer.sheets["UG+PG"]
+
+            # Columns to merge = the original TA Assignment columns (not TA-per-row columns)
+            original_cols = st.session_state.get("original_assign_cols", [])
+            TA_RESULT_COLS = [
+                "TA Name", "Leading TA", "TA ENG Name", "TA Email",
+                "USTF Name", "USTF ENG Name", "USTF Email",
+                "Comments (TA)", "Comments (Instructor)"
+            ]
+            columns_to_merge = [c for c in original_cols if c not in TA_RESULT_COLS]
+            # Identify the "Course Code" column name in the *final* df (it’s preserved)
+            code_col_name = _find_col(st.session_state.assign_df, "Course Code") or "Course Code"
+
+            _merge_common_columns_in_excel(
+                ws,
+                st.session_state.assign_df,
+                code_col_name,
+                columns_to_merge
+            )
+        except Exception as e:
+            LOG.log("WARN", "MERGE_CELLS_FAILED", detail=str(e))
+    
     buffer.seek(0)
     st.download_button(
         label="📥 Generate Assignment XLSX",
