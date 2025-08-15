@@ -27,6 +27,13 @@ except Exception:
 
 from openpyxl.styles import Alignment
 
+
+TA_RESULT_COLS = [
+    "TA Name", "Leading TA", "TA ENG Name", "TA Email",
+    "USTF Name", "USTF ENG Name", "USTF Email",
+    "Comments (TA)", "Comments (Instructor)", 'Supervisor', 'Cohort', 'Major', 'USTF ID'
+]
+
 # ======================================================================
 # Logging helper
 # ======================================================================
@@ -880,8 +887,14 @@ def build_assignment_dataframe(courses: Dict[str, dict],
                                original_assign_df: pd.DataFrame) -> pd.DataFrame:
     """
     Build final assignment dataframe, preserving ALL columns from the uploaded Teaching Assignment.
-    One TA per row, duplicating original row data only on the FIRST row for each course;
-    subsequent rows leave original columns blank to avoid repetition.
+
+    For each course:
+      - The number of output rows == TA number from the original assignment (rounded).
+      - If TA number is non-numeric: output exactly 1 row.
+      - If assigned TAs < required rows: pad with empty TA fields.
+      - If assigned TAs > required rows (shouldn't happen after cap enforcement): truncate to required rows.
+      - Only the FIRST row keeps original assignment columns; subsequent rows have those original columns blank.
+      - TA result columns are NEVER blanked for rows that carry a TA; empty rows keep them empty by design.
     """
     def resolve_one(pair: Tuple[str, Optional[str]]) -> Tuple[str, str, str]:
         name, sid = pair
@@ -893,18 +906,12 @@ def build_assignment_dataframe(courses: Dict[str, dict],
             return zh, en, em
         return name, name, ""
 
-    # Locate Course Code column to align rows
+    # Locate column names needed from the original DF
     code_col = _find_col(original_assign_df, "Course Code")
     if not code_col:
         raise ValueError("Course Code column not found in original Teaching Assignment file.")
 
-    # TA-related columns we add/modify (not part of 'original columns' dedup rule)
-    ta_cols = [
-        "TA Name", "Leading TA", "TA ENG Name", "TA Email",
-        "USTF Name", "USTF ENG Name", "USTF Email",
-        "Comments (TA)", "Comments (Instructor)"
-    ]
-
+    # We will append rows while preserving original columns’ order
     rows = []
     for _, orig_row in original_assign_df.iterrows():
         code = str(orig_row[code_col]).replace(" ", "").strip()
@@ -912,8 +919,22 @@ def build_assignment_dataframe(courses: Dict[str, dict],
             continue
 
         m = courses[code]
+        # Build ordered TA pairs (leading first, then others)
         pairs_leading = list(m.get("leading_ta", []))
-        pairs_keep = list(m.get("ta_supervisor", [])) + list(m.get("ta_instr_only", [])) + list(m.get("ta_student_only", []))
+        pairs_other   = list(m.get("ta_supervisor", [])) + list(m.get("ta_instr_only", [])) + list(m.get("ta_student_only", []))
+        assigned_pairs: List[Tuple[str, Optional[str]]] = pairs_leading + pairs_other
+
+        # Determine required rows from the original TA number
+        raw_slots = m.get("ta_slots", "")
+        q = _parse_int(raw_slots)   # rounds decimals; returns None if non-numeric
+        if q is None:
+            required_rows = 1            # non-numeric => exactly one row
+        else:
+            required_rows = max(0, q)    # numeric => exactly q rows (0 allowed)
+
+        # If required_rows is 0, skip emitting any row for this course
+        if required_rows == 0:
+            continue
 
         # Precompute aggregated USTF text once per course
         ustf_pairs = list(m.get("ustf_instr", [])) + list(m.get("ustf_ta", []))
@@ -925,33 +946,32 @@ def build_assignment_dataframe(courses: Dict[str, dict],
         ustf_en = ", ".join(filter(None, ustf_en_list))
         ustf_em = ", ".join(filter(None, ustf_em_list))
 
-        made_any_row = False
-        is_first_for_course = True
-
-        # Helper to create a row, blanking original columns if not first
-        def make_row(is_leading_flag: bool, pair: Tuple[str, Optional[str]] | None):
-            nonlocal is_first_for_course, made_any_row
+        # Emit exactly `required_rows` rows
+        for idx in range(required_rows):
             new_row = orig_row.copy()
 
-            # If not the first row for this course, blank original columns to avoid repetition
-            if not is_first_for_course:
+            # Only the FIRST row keeps original columns; subsequent rows blank ONLY original columns
+            if idx > 0:
                 for col in original_assign_df.columns:
                     new_row[col] = ""
 
-            if pair is None:
-                # No TA case for this course
+            if idx < len(assigned_pairs):
+                # Fill TA fields for an assigned TA
+                is_leading = idx < len(pairs_leading)
+                pair = assigned_pairs[idx]
+                zh, en, em = resolve_one(pair)
+                new_row["TA Name"] = zh
+                new_row["Leading TA"] = zh if is_leading else ""
+                new_row["TA ENG Name"] = en
+                new_row["TA Email"] = em
+            else:
+                # Padding rows: leave TA fields empty
                 new_row["TA Name"] = ""
                 new_row["Leading TA"] = ""
                 new_row["TA ENG Name"] = ""
                 new_row["TA Email"] = ""
-            else:
-                zh, en, em = resolve_one(pair)
-                new_row["TA Name"] = zh
-                new_row["Leading TA"] = zh if is_leading_flag else ""
-                new_row["TA ENG Name"] = en
-                new_row["TA Email"] = em
 
-            # Always fill (course-level) aggregated/derived columns
+            # Always fill course-level derived columns per row
             new_row["USTF Name"] = ustf_zh
             new_row["USTF ENG Name"] = ustf_en
             new_row["USTF Email"] = ustf_em
@@ -959,27 +979,16 @@ def build_assignment_dataframe(courses: Dict[str, dict],
             new_row["Comments (Instructor)"] = m.get("instr_comments", "")
 
             rows.append(new_row)
-            made_any_row = True
-            is_first_for_course = False
-
-        # Emit rows: leading TAs first, then other TAs
-        for is_leading, plist in [(True, pairs_leading), (False, pairs_keep)]:
-            for pair in plist:
-                make_row(is_leading, pair)
-
-        # If no TA at all, still emit one placeholder row
-        if not made_any_row:
-            make_row(False, None)
 
     final_df = pd.DataFrame(rows)
 
-    # Ensure TA-related columns exist even if empty
-    for col in ta_cols:
+    # Ensure the TA result columns exist even if a particular dataset yields none
+    for col in TA_RESULT_COLS:
         if col not in final_df.columns:
             final_df[col] = ""
 
-    # Preserve original column order; append any new columns at the end
-    col_order = list(original_assign_df.columns) + [c for c in ta_cols if c not in original_assign_df.columns]
+    # Preserve original column order; append TA result columns at the end when missing
+    col_order = list(original_assign_df.columns) + [c for c in TA_RESULT_COLS if c not in original_assign_df.columns]
     return final_df[col_order]
 
 
@@ -1214,11 +1223,7 @@ if assign_file and namelist_file and instr_file and stud_file:
 
             # Columns to merge = the original TA Assignment columns (not TA-per-row columns)
             original_cols = st.session_state.get("original_assign_cols", [])
-            TA_RESULT_COLS = [
-                "TA Name", "Leading TA", "TA ENG Name", "TA Email",
-                "USTF Name", "USTF ENG Name", "USTF Email",
-                "Comments (TA)", "Comments (Instructor)"
-            ]
+            # UNMERGE_COLS = TA_RESULT_COLS.extend(['Supervisor', 'Cohort', 'Major', 'USTF ID'])
             columns_to_merge = [c for c in original_cols if c not in TA_RESULT_COLS]
             # Identify the "Course Code" column name in the *final* df (it’s preserved)
             code_col_name = _find_col(st.session_state.assign_df, "Course Code") or "Course Code"
