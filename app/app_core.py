@@ -1,6 +1,6 @@
 # app_core.py
 """
-EasyMatcher (Revised, with full logging, guaranteed match, and strict TA caps)
+EasyMatcher (Revised, with full logging, USTF normalization/matching, and strict TA caps)
 
 Run:
   pip install streamlit pandas openpyxl scikit-learn
@@ -16,8 +16,9 @@ from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
+from dataclasses import dataclass
 
-# Optional: scikit-learn for semantic matching
+# Optional: scikit-learn for semantic matching (used only for TA fallback)
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -30,10 +31,12 @@ from openpyxl.styles import Alignment
 
 TA_RESULT_COLS = [
     "TA Name", "Leading TA", "TA ENG Name", "TA Email",
-    "USTF Name", "USTF ENG Name", "USTF Email",
-    "Comments (TA)", "Comments (Instructor)", 'Supervisor', 'Cohort', 'Major', 'USTF ID'
+    "Comments (TA)", "Comments (Instructor)", 'Supervisor', 'Cohort', 'Major'
 ]
 
+USTF_RESULT_COLS = [
+    "USTF Name", "USTF ID", "USTF ENG Name", "USTF Email", "USTF Justification"
+]
 # ======================================================================
 # Logging helper
 # ======================================================================
@@ -47,7 +50,7 @@ class RunLogger:
             student_name: str = "", detail: str = ""):
         self.rows.append({
             "level": level.upper(),      # INFO/WARN/ERROR
-            "event": event,              # e.g., MATCH, UNRECOGNIZED_NAME, SEMANTIC_SCORE
+            "event": event,              # e.g., MATCH, USTF_MATCH, UNRECOGNIZED_NAME
             "course_code": course,
             "student_id": student_id,
             "student_name": student_name,
@@ -84,10 +87,6 @@ def _read_main_or_first(uploaded_file, prefer: List[str] | None = None) -> pd.Da
     return xl.parse(sheet_name=target_sheet)
 
 def _normalize_header(h: str) -> str:
-    """
-    Lowercase, collapse whitespace, and strip punctuation for resilient matching.
-    Makes 'Course instructor's name' ~ 'course instructors name' ~ 'Course instructor's name'.
-    """
     s = re.sub(r"\s+", " ", str(h).strip().lower())
     s = re.sub(r"[^a-z0-9\s]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -97,9 +96,6 @@ def _find_col(df: pd.DataFrame, substr: str,
               prefer_exact: bool = True,
               disallow_prefixes: tuple[str, ...] = ("unnamed:",),
               exclude_contains: tuple[str, ...] = ()) -> str | None:
-    """
-    Find a column by name (normalized). Prefer exact, then substring; skip 'Unnamed:*' and excluded tokens.
-    """
     target_norm = _normalize_header(substr)
     cols = [(c, _normalize_header(c)) for c in df.columns]
 
@@ -246,7 +242,6 @@ def _count_assigned_including_leading(meta: dict) -> int:
     return sum(len(meta.get(k, [])) for k in ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"))
 
 def _quota_remaining(meta: dict) -> int:
-    """Remaining slots for this course (leading + all TA buckets count)."""
     q = _parse_int(meta.get("ta_slots", ""))
     if q is None or q < 0:
         q = 0
@@ -254,11 +249,9 @@ def _quota_remaining(meta: dict) -> int:
     return max(0, q - assigned)
 
 def _remaining_slots_map(courses: Dict[str, dict]) -> Dict[str, int]:
-    """code -> remaining slots (non-negative)."""
     return {c: _quota_remaining(m) for c, m in courses.items()}
 
 def _eligible_codes_by_priority(courses: Dict[str, dict], rem: Dict[str, int]) -> list[str]:
-    """Course codes with remaining capacity, sorted by (type priority, code)."""
     return sorted(
         [c for c in courses if rem.get(c, 0) > 0],
         key=lambda c: (_course_rank(courses[c].get("type", "")), c)
@@ -272,25 +265,20 @@ def _merge_common_columns_in_excel(ws, df: pd.DataFrame, code_col_name: str, col
     if code_col_name not in df.columns:
         return
 
-    # Map column name -> 1-based Excel column index
     col_idx = {c: (df.columns.get_loc(c) + 1) for c in df.columns}
 
-    # Walk the dataframe to find contiguous blocks (by Course Code)
     n = len(df)
     i = 0
     while i < n:
         code = str(df.iloc[i][code_col_name])
-        # empty code rows: just advance
         if not code:
             i += 1
             continue
 
-        # find the end of this contiguous course block
         j = i + 1
         while j < n and str(df.iloc[j][code_col_name]) == "":
             j += 1
 
-        # Merge each "original" column across [i..j-1] if block length > 1
         if j - i > 1:
             start_row = i + 2  # +1 header row, +1 to convert 0-index to 1-index
             end_row   = j + 1
@@ -301,6 +289,100 @@ def _merge_common_columns_in_excel(ws, df: pd.DataFrame, code_col_name: str, col
                 ws.merge_cells(start_row=start_row, start_column=c, end_row=end_row, end_column=c)
                 ws.cell(row=start_row, column=c).alignment = Alignment(vertical="center")
         i = j
+
+# -------------------------
+# USTF normalization helpers
+# -------------------------
+
+_GRADE_ORDER = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C", "C-", "D+", "D", "F"]
+_GRADE_RANK = {g: i for i, g in enumerate(_GRADE_ORDER)}  # lower index = better
+
+def _norm_gpa(val) -> Optional[float]:
+    """
+    Normalize GPA like '3.7+', '3,85', 'GPA: 3.9' -> float or None.
+    Caps to [0, 5] to kill outliers.
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    s = s.replace(",", ".")
+    m = re.search(r"(\d+(\.\d+)?)", s)
+    if not m:
+        return None
+    g = float(m.group(1))
+    g = max(0.0, min(5.0, g))
+    return g
+
+def _norm_grade_letter(s: str) -> Optional[str]:
+    """
+    Normalize letters like 'A', 'a+', 'B plus', 'B＋', 'B +' -> canonical in _GRADE_ORDER.
+    Returns None if unresolvable.
+    """
+    if not s or pd.isna(s):
+        return None
+    t = str(s).strip().upper()
+    t = t.replace("＋", "+").replace("－", "-").replace("–","-").replace("PLUSS","+")
+    t = re.sub(r"\s+", "", t)
+    t = t.replace("PLUS", "+").replace("MINUS", "-")
+    if t in _GRADE_RANK:
+        return t
+    if t in {"A", "A+", "A-","B","B+","B-","C","C+","C-","D","D+","F"}:
+        return t
+    return None
+
+def _grade_ge(got: Optional[str], need: str) -> bool:
+    if got is None:
+        return False
+    if got not in _GRADE_RANK or need not in _GRADE_RANK:
+        return False
+    return _GRADE_RANK[got] <= _GRADE_RANK[need]
+
+def _parse_priority_cell(cell) -> tuple[str, Optional[str]]:
+    """
+    Parse "CSC1001, A", "CSC1001 A+", "CSC1001(A-)", "CSC1001（A）", "CSC1001A", "CSC1001A-" → (code, grade|None)
+    Accepts 3–5 letter prefixes and 4–5 digit numbers.
+    """
+    if pd.isna(cell):
+        return "", None
+    s = str(cell).strip()
+    if not s:
+        return "", None
+
+    # Normalize punctuation; KEEP parentheses for grade capture
+    t = s
+    t = t.replace("（", "(").replace("）", ")")
+    t = t.replace("，", ",").replace("；", ";").replace("：", ":")
+    t = re.sub(r"\s+", "", t)  # remove spaces
+    t = t.replace("＋", "+").replace("－", "-").replace("–", "-")
+
+    # 1) CODE(GRADE)
+    m = re.match(r"^([A-Za-z]{3,5}\d{4,5})\(([A-Za-z][+-]?)\)$", t)
+    if m:
+        return m.group(1).upper(), _norm_grade_letter(m.group(2))
+
+    # 2) CODE[,;:]GRADE
+    m = re.match(r"^([A-Za-z]{3,5}\d{4,5})[,;:]+([A-Za-z][+-]?)$", t)
+    if m:
+        return m.group(1).upper(), _norm_grade_letter(m.group(2))
+
+    # 3) CODE + glued GRADE (e.g., CSC1001A or CSC1001A-)
+    m = re.match(r"^([A-Za-z]{3,5}\d{4,5})(A\+|A-|A|B\+|B-|B|C\+|C-|C|D\+|D|F)$", t, flags=re.I)
+    if m:
+        return m.group(1).upper(), _norm_grade_letter(m.group(2))
+
+    # 4) Plain CODE only
+    m = re.match(r"^([A-Za-z]{3,5}\d{4,5})$", t)
+    if m:
+        return m.group(1).upper(), None
+
+    # 5) Last-ditch split on ASCII & CJK separators
+    parts = re.split(r"[,;:，；：]", t, maxsplit=1)
+    code = (parts[0] if parts else "").upper()
+    grade = _norm_grade_letter(parts[1]) if len(parts) > 1 else None
+    return code, grade
+
 
 # ======================================================================
 # Loaders
@@ -349,9 +431,7 @@ def load_ta_name_list(df: pd.DataFrame):
     """
     From the TA Name List file.
     Return:
-      - id_to_profile: sid -> {
-            name_zh, name_en, email, cohort, major, sup_en, sup_zh, field
-        }
+      - id_to_profile: sid -> { name_zh, name_en, email, cohort, major, sup_en, sup_zh, field }
       - name_to_id: both EN canonical + CN name -> sid
     """
     zh_col = _find_col(df, "Name", prefer_exact=True, disallow_prefixes=("unnamed:",)) or \
@@ -459,7 +539,6 @@ def load_instructor_sheet(df: pd.DataFrame) -> Dict[str, dict]:
     return courses
 
 def load_student_prefs(df: pd.DataFrame) -> Dict[str, dict]:
-    # name_col is optional here (used only for debug / expansion)
     _ = _find_col(df, "Full Name") or _find_col(df, "Normalized Name")
     sid_col  = _find_col(df, "Student ID")
     other_col = _find_col(df, "Other information")
@@ -521,9 +600,113 @@ def build_student_map(id_to_profile: Dict[str, dict], pref_map: Dict[str, dict])
     LOG.log("INFO", "STUDENT_MAP_SIZE", detail=str(len(student_map)))
     return student_map, name_to_id
 
+@dataclass
+class USTFRecord:
+    sid: str
+    name_zh: str
+    name_en: str
+    email: str
+    gpa: Optional[float]
+    english_best: Optional[str]
+    priorities: list[dict]   # [{order:1, code:"CSC1001", grade:"A", pass_general:True/False}, ...]
+    other_info: str          # col 11
+    justification_14: str    # col 14
+    justification_15: str    # col 15
+
+def load_ustf_preference(df: pd.DataFrame) -> tuple[dict, dict, pd.DataFrame]:
+    """
+    Normalize USTF sheet and evaluate general requirements per intended course.
+    Adds pass flags for priorities and returns:
+      - ustf_map: sid -> USTFRecord
+      - name_to_sid: canonical CN/EN -> sid
+      - normalized_df: tidy view with pass flags and cleaned values
+    """
+    # locate columns (robust / fuzzy)
+    sid_col = _find_col(df, "3、Student ID") or _find_col(df, "Student ID")
+    email_col = _find_col(df, "Email")
+    name_en_col = _find_col(df, "English Name") or _find_col(df, "Full Name")
+    name_zh_col = _find_col(df, "1、Full Name （For Chinese students, please enter your full name in Chinese）") or _find_col(df, "Name")
+
+    gpa_col = _find_col(df, "5、cGPA") or _find_col(df, "cGPA")
+    eng_best_col = _find_col(df, "6、The highest score of one of your English courses") or _find_col(df, "English")
+    pri1_col = _find_col(df, "7、First Priority") or _find_col(df, "First Priority")
+    pri2_col = _find_col(df, "8、Second Priority") or _find_col(df, "Second Priority")
+    pri3_col = _find_col(df, "9、Third Priority") or _find_col(df, "Third Priority")
+    pri4_col = _find_col(df, "10、Fourth Priority") or _find_col(df, "Fourth Priority")
+
+    other11_col = _find_col(df, "11、Other information") or _find_col(df, "Other information")
+    just14_col = _find_col(df, "14、If the above requirements are not fulfilled") or _find_col(df, "14")
+    just15_col = _find_col(df, "15、Remark") or _find_col(df, "Remark")
+
+    if not sid_col:
+        raise ValueError("USTF sheet: 'Student ID' column not found.")
+
+    norm_rows = []
+    ustf_map: dict[str, USTFRecord] = {}
+    name_to_sid: dict[str, str] = {}
+
+    for _, r in df.iterrows():
+        sid = _get_id(r[sid_col])
+        if sid == "unknown":
+            LOG.log("WARN", "USTF_MISSING_SID", detail=str(r.to_dict()))
+            continue
+
+        name_en = _canon_eng_name(r[name_en_col]) if name_en_col else ""
+        name_zh = _canon_chn_name(r[name_zh_col]) if name_zh_col else ""
+        email = str(r[email_col]).strip() if (email_col and not pd.isna(r[email_col])) else ""
+
+        gpa = _norm_gpa(r[gpa_col]) if gpa_col else None
+        eng_best = _norm_grade_letter(r[eng_best_col]) if eng_best_col else None
+
+        priorities = []
+        for i, col in enumerate([pri1_col, pri2_col, pri3_col, pri4_col], start=1):
+            code, grade = _parse_priority_cell(r[col] if col else "")
+            if not code:
+                continue
+            pass_general = (gpa is not None and gpa >= 3.4) and _grade_ge(grade, "A") and _grade_ge(eng_best, "B+")
+            priorities.append({"order": i, "code": code, "grade": grade, "pass_general": pass_general})
+
+        other11 = "" if (not other11_col or pd.isna(r[other11_col])) else str(r[other11_col]).strip()
+        j14 = "" if (not just14_col or pd.isna(r[just14_col])) else str(r[just14_col]).strip()
+        j15 = "" if (not just15_col or pd.isna(r[just15_col])) else str(r[just15_col]).strip()
+
+        rec = USTFRecord(
+            sid=sid, name_zh=name_zh, name_en=name_en, email=email,
+            gpa=gpa, english_best=eng_best, priorities=priorities,
+            other_info=other11, justification_14=j14, justification_15=j15
+        )
+        ustf_map[sid] = rec
+
+        if name_en:
+            name_to_sid[name_en] = sid
+        if name_zh:
+            name_to_sid[name_zh] = sid
+
+        # normalized row
+        out = {
+            "Student ID": sid,
+            "Name EN": name_en,
+            "Name ZH": name_zh,
+            "Email": email,
+            "cGPA": gpa if gpa is not None else "",
+            "English Highest": eng_best or "",
+        }
+        for p in priorities:
+            prefix = ["First","Second","Third","Fourth"][p["order"]-1]
+            out[f"{prefix} Priority Code"] = p["code"]
+            out[f"{prefix} Priority Grade"] = p["grade"] or ""
+            out[f"{prefix} Priority Pass"] = "YES" if p["pass_general"] else "NO"
+        out["Other information (11)"] = other11
+        out["Justification (14)"] = j14
+        out["Remark (15)"] = j15
+        norm_rows.append(out)
+
+    normalized_df = pd.DataFrame(norm_rows)
+    LOG.log("INFO", "USTF_PREF_COUNT", detail=str(len(ustf_map)))
+    return ustf_map, name_to_sid, normalized_df
 
 # ======================================================================
-# Matching logic (revised)
+# Matching logic (TA + USTF)
 # ======================================================================
 
 def _course_rank(t: str) -> int:
@@ -541,7 +724,7 @@ def perform_matching(courses_from_instr: Dict[str, dict],
                      student_map: Dict[str, dict],
                      name_to_id: Dict[str, str]) -> set[str]:
     """
-    Priority:
+    TA matching priority:
       (1) Supervisor preference for own student
       (2) Instructor preference (remaining)
       (3) Course priority PG→UG→TPG
@@ -624,13 +807,210 @@ def perform_matching(courses_from_instr: Dict[str, dict],
 
     return matched
 
+def _ustf_quota(meta: dict) -> int:
+    q = _parse_int(meta.get("ustf_slots", ""))
+    return max(0, q or 0)
+
+def _ustf_take_until_quota(meta: dict, pairs: list[tuple[str, str]], reason: str):
+    """Append assigned USTFs to meta['ustf_assigned'] in order until quota is filled."""
+    if "ustf_assigned" not in meta:
+        meta["ustf_assigned"] = []  # [(sid, display_name, reason)]
+    capacity = _ustf_quota(meta) - len(meta["ustf_assigned"])
+    for sid, disp in pairs:
+        if capacity <= 0:
+            break
+        meta["ustf_assigned"].append((sid, disp, reason))
+        capacity -= 1
+
+def _ustf_display_name(u: USTFRecord) -> str:
+    return u.name_en or u.name_zh or u.sid
+
+def _ustf_build_justification(u: USTFRecord) -> str:
+    # "{col 11} (other information) {col 14}\n{col 15} (justification)"
+    p11 = (u.other_info or "").strip()
+    p14 = (u.justification_14 or "").strip()
+    p15 = (u.justification_15 or "").strip()
+    parts = []
+    if p11:
+        parts.append(f"{p11} (other information)")
+    if p14:
+        parts.append(p14)
+    line2 = f"{p15} (justification)" if p15 else ""
+    return (" ".join(parts)).strip() + (("\n" + line2) if line2 else "")
+
+def match_ustf(
+    courses_assign: Dict[str, dict],
+    courses_instr: Dict[str, dict],
+    ustf_map: Dict[str, USTFRecord],
+    ustf_name_to_sid: Dict[str, str],
+) -> tuple[set[str], pd.DataFrame]:
+    """
+    Policy:
+    1) If instructor/TA nominates a USTF who also chose this course, assign (respecting ustf quota).
+    2) Otherwise, assign those who passed general requirements by priority order (1..4), tie-break by cGPA desc.
+    3) If still capacity, assign those who did not pass, ordered by priority then cGPA desc.
+
+    Returns:
+        matched_ustf_sids, unmatched_ustf_df (compact preview; full original kept elsewhere)
+    """
+    # Ensure per-course containers
+    for meta in courses_assign.values():
+        meta.setdefault("ustf_assigned", [])
+        meta.setdefault("ustf_just_texts", [])
+
+    # === Global set of students already assigned to ANY course (fixes multi-course duplication)
+    assigned_sids: set[str] = {
+        sid for m in courses_assign.values() for (sid, *_r) in m.get("ustf_assigned", [])
+    }
+
+    # Build quick lookup: course -> {sid -> (best_priority_order, pass_general, cGPA)}
+    course_pref: Dict[str, Dict[str, dict]] = {}
+    for sid, u in ustf_map.items():
+        for p in u.priorities:
+            code = p["code"]
+            course_pref.setdefault(code, {})
+            prev = course_pref[code].get(sid)
+            if (prev is None) or (p["order"] < prev["order"]):
+                course_pref[code][sid] = {
+                    "order": p["order"],
+                    "pass": bool(p["pass_general"]),
+                    "gpa": (u.gpa if u.gpa is not None else -1.0),
+                }
+
+    # 1) Instructor nominations (only if the student also chose the course), excluding already assigned
+    for code, meta in courses_assign.items():
+        names = []
+        if code in courses_instr:
+            names = courses_instr[code].get("ustf_instr", [])
+            names = [n[0] if isinstance(n, tuple) else n for n in names]
+
+        # resolve names -> sids (unique preserve order)
+        resolved = []
+        seen = set()
+        for nm in names:
+            sid = ustf_name_to_sid.get(nm)
+            if not sid:
+                LOG.log("WARN", "USTF_NOMINATED_NAME_NOT_FOUND", course=code, student_name=nm)
+                continue
+            if sid not in seen:
+                resolved.append(sid)
+                seen.add(sid)
+
+        chosen = []
+        for sid in resolved:
+            if sid in assigned_sids:
+                continue
+            if sid in course_pref.get(code, {}):
+                chosen.append((sid, _ustf_display_name(ustf_map[sid])))
+
+        if chosen:
+            before = len(meta.get("ustf_assigned", []))
+            _ustf_take_until_quota(meta, chosen, reason="Nominated by instructor + chose course")
+            # mark newly assigned globally
+            for sid, *_ in meta["ustf_assigned"][before:]:
+                assigned_sids.add(sid)
+                LOG.log("INFO", "USTF_MATCH", course=code, student_id=sid,
+                        student_name=_ustf_display_name(ustf_map[sid]),
+                        detail="Nominated by instructor + chose this course")
+
+    # 1b) TA nominations via student preferences' 'USTF Remark', excluding already assigned
+    try:
+        stud_map = st.session_state.get("student_map", {})
+    except Exception:
+        stud_map = {}
+    if stud_map:
+        ta_nom_sids = set()
+        for _sid, s in stud_map.items():
+            for raw in s.get("ustf_remark", []):
+                sid2 = ustf_name_to_sid.get(raw)
+                if sid2:
+                    ta_nom_sids.add(sid2)
+
+        for code, meta in courses_assign.items():
+            chosen = [
+                (sid, _ustf_display_name(ustf_map[sid]))
+                for sid in ta_nom_sids
+                if sid not in assigned_sids and sid in course_pref.get(code, {})
+            ]
+            if chosen:
+                before = len(meta["ustf_assigned"])
+                _ustf_take_until_quota(meta, chosen, reason="Nominated by TA + chose course")
+                for sid, *_ in meta["ustf_assigned"][before:]:
+                    assigned_sids.add(sid)
+                    LOG.log("INFO", "USTF_MATCH", course=code, student_id=sid,
+                            student_name=_ustf_display_name(ustf_map[sid]),
+                            detail="Nominated by TA + chose this course")
+
+    # 2) & 3) Pass-first then Fail, within quota, always filtering by up-to-date assigned_sids
+    for code, meta in courses_assign.items():
+        if len(meta["ustf_assigned"]) >= _ustf_quota(meta):
+            continue
+
+        pool = course_pref.get(code, {})
+        # exclude already assigned everywhere
+        passed = [(sid, data["order"], data["gpa"]) for sid, data in pool.items()
+                  if sid not in assigned_sids and data["pass"]]
+        failed = [(sid, data["order"], data["gpa"]) for sid, data in pool.items()
+                  if sid not in assigned_sids and not data["pass"]]
+
+        # order: priority asc, gpa desc
+        passed.sort(key=lambda x: (x[1], -x[2]))
+        failed.sort(key=lambda x: (x[1], -x[2]))
+
+        # take passed
+        if passed:
+            choose = [(sid, _ustf_display_name(ustf_map[sid])) for sid, _, _ in passed]
+            before = len(meta["ustf_assigned"])
+            _ustf_take_until_quota(meta, choose, reason="USTF priority + passed general requirements")
+            # update global assigned after this course's assignment
+            for sid, *_ in meta["ustf_assigned"][before:]:
+                assigned_sids.add(sid)
+                LOG.log("INFO", "USTF_MATCH", course=code, student_id=sid,
+                        student_name=_ustf_display_name(ustf_map[sid]),
+                        detail="Priority + passed general requirements")
+
+        # if still capacity, take failed
+        if len(meta["ustf_assigned"]) < _ustf_quota(meta) and failed:
+            choose2 = [(sid, _ustf_display_name(ustf_map[sid])) for sid, _, _ in failed]
+            before = len(meta["ustf_assigned"])
+            _ustf_take_until_quota(meta, choose2, reason="USTF priority (did not pass general requirements)")
+            for sid, *_ in meta["ustf_assigned"][before:]:
+                assigned_sids.add(sid)
+                LOG.log("INFO", "USTF_MATCH", course=code, student_id=sid,
+                        student_name=_ustf_display_name(ustf_map[sid]),
+                        detail="Priority but did not pass general requirements")
+
+    # Compact unmatched preview (full original handled elsewhere for export)
+    matched_ustf = set(assigned_sids)
+    rows = []
+    for sid, u in ustf_map.items():
+        if sid in matched_ustf:
+            continue
+        p = sorted(u.priorities, key=lambda x: x["order"])
+        def _p(i, key): return (p[i][key] if len(p) > i else "")
+        rows.append({
+            "Student ID": sid,
+            "Name EN": u.name_en,
+            "Name ZH": u.name_zh,
+            "Email": u.email,
+            "cGPA": u.gpa if u.gpa is not None else "",
+            "English Highest": u.english_best or "",
+            "First Priority": _p(0, "code"),
+            "First Grade": _p(0, "grade") or "",
+            "First Pass": "YES" if (len(p) > 0 and p[0]["pass_general"]) else ("NO" if len(p) > 0 else ""),
+            "Second Priority": _p(1, "code"),
+            "Second Grade": _p(1, "grade") or "",
+            "Second Pass": "YES" if (len(p) > 1 and p[1]["pass_general"]) else ("NO" if len(p) > 1 else ""),
+        })
+    unmatched_df = pd.DataFrame(rows)
+    return matched_ustf, unmatched_df
+
 
 # ======================================================================
-# Semantic & fallbacks (guaranteed completion)
+# Semantic & fallbacks (TA only; USTF does NOT use background)
 # ======================================================================
 
 def _semantic_assign_unmatched(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
-    """TF-IDF cosine(student background vs course text), respecting remaining capacity."""
     if not _HAS_SKLEARN:
         LOG.log("WARN", "SEMANTIC_DISABLED", detail="scikit-learn not installed")
         return
@@ -674,10 +1054,10 @@ def _semantic_assign_unmatched(courses: Dict[str, dict], student_map: Dict[str, 
                     detail=f"Semantic background match (score={best_score:.4f})")
 
 def _keyword_fallback_assign(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
-    """Cheap keyword overlap fallback, respecting remaining capacity."""
     rem = _remaining_slots_map(courses)
     def ordered_eligible():
-        return _eligible_codes_by_priority(courses, rem)
+        return sorted([c for c in courses if rem.get(c, 0) > 0],
+                      key=lambda c: (_course_rank(courses[c].get("type","")), c))
     for sid, s in student_map.items():
         if sid in matched:
             continue
@@ -702,10 +1082,10 @@ def _keyword_fallback_assign(courses: Dict[str, dict], student_map: Dict[str, di
                     detail=f"Keyword fallback (hits={best_hit})")
 
 def _balanced_fill_any_remaining(courses: Dict[str, dict], student_map: Dict[str, dict], matched: set[str]):
-    """As a last resort, place remaining students by load-balance into courses with capacity."""
     rem = _remaining_slots_map(courses)
     def eligible():
-        return _eligible_codes_by_priority(courses, rem)
+        return sorted([c for c in courses if rem.get(c, 0) > 0],
+                      key=lambda c: (_course_rank(courses[c].get("type","")), c))
     def count_tas(meta: dict) -> int:
         return sum(len(meta.get(k, [])) for k in
                    ("leading_ta","ta_supervisor","ta_instr_only","ta_student_only"))
@@ -1015,6 +1395,150 @@ def build_unmatched_dataframe(student_map: Dict[str, dict], matched: set[str]) -
         })
     return pd.DataFrame(rows)
 
+def build_ustf_dataframe(courses: Dict[str, dict],
+                         original_assign_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a separate USTF sheet:
+      - One USTF per row.
+      - Number of rows per course == USTF number from Teaching Assignment (rounded).
+      - If non-numeric USTF number: exactly 1 row.
+      - If assigned USTFs < required rows: pad with empty USTF fields.
+      - Only the FIRST row per course keeps the original assignment columns; subsequent rows have those original cols blank.
+      - Include a 'USTF Justification' column (built from cols 11/14/15 of USTF preference).
+    """
+    if "ustf_map" not in st.session_state:
+        # No ustf normalization loaded
+        return pd.DataFrame()
+
+    ustf_map: Dict[str, any] = st.session_state.ustf_map
+
+    code_col = _find_col(original_assign_df, "Course Code")
+    if not code_col:
+        raise ValueError("Course Code column not found in original Teaching Assignment file (USTF sheet builder).")
+
+    def _resolve_from_ustf_sid(sid: str) -> Tuple[str, str, str, str]:
+        # zh, en, email, justification
+        u = ustf_map.get(sid)
+        if not u:
+            return "", "", "", ""
+        zh = getattr(u, "name_zh", "") or ""
+        en = getattr(u, "name_en", "") or ""
+        em = getattr(u, "email", "") or ""
+        just = _ustf_build_justification(u) if "_ustf_build_justification" in globals() else ""
+        return zh, en, em, just
+
+    rows = []
+    for _, orig_row in original_assign_df.iterrows():
+        code = str(orig_row[code_col]).replace(" ", "").strip()
+        if not code or code not in courses:
+            continue
+
+        meta = courses[code]
+        # how many rows to emit for this course
+        raw_slots = meta.get("ustf_slots", "")
+        q = _parse_int(raw_slots)
+        required_rows = 1 if q is None else max(0, q)
+        if required_rows == 0:
+            continue
+
+        assigned = list(meta.get("ustf_assigned", []))  # list of (sid, display_name, reason)
+
+        # Emit exact required_rows
+        for i in range(required_rows):
+            new_row = orig_row.copy()
+            if i > 0:
+                # blank only original assignment columns
+                for col in original_assign_df.columns:
+                    new_row[col] = ""
+
+            if i < len(assigned):
+                sid, disp, reason = assigned[i]
+                zh, en, em, just = _resolve_from_ustf_sid(sid)
+                new_row["USTF Name"] = zh or disp
+                new_row["USTF ENG Name"] = en or disp
+                new_row["USTF Email"] = em
+                new_row["USTF Justification"] = just  # <-- ensure not empty
+                new_row["USTF Match Reason"] = reason  # optional, useful in sheet
+            else:
+                new_row["USTF Name"] = ""
+                new_row["USTF ENG Name"] = ""
+                new_row["USTF Email"] = ""
+                new_row["USTF Justification"] = ""
+                new_row["USTF Match Reason"] = ""
+
+            rows.append(new_row)
+
+    df = pd.DataFrame(rows)
+
+    # Ensure these columns exist even if empty in this run
+    for col in ["USTF Name", "USTF ENG Name", "USTF Email", "USTF Justification", "USTF Match Reason"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Preserve original order + append our USTF columns at the end
+    tail_cols = ["USTF Name", "USTF ENG Name", "USTF Email", "USTF Justification", "USTF Match Reason"]
+    col_order = list(original_assign_df.columns) + [c for c in tail_cols if c not in original_assign_df.columns]
+    return df[col_order]
+
+def build_unmatched_ustf_dataframe(original_ustf_df: pd.DataFrame,
+                                   ustf_map: Dict[str, any],
+                                   matched_ustf_sids: set[str],
+                                   ustf_norm_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """
+    Return the original USTF preference rows for SIDs not matched,
+    and append the Pass columns (First/Second/Third/Fourth Priority Pass).
+    - Keeps ALL original columns (order preserved).
+    - Adds pass columns to the right.
+    """
+    # create SID col name for lookup
+    sid_col = _find_col(original_ustf_df, "Student ID") or _find_col(original_ustf_df, "学号")
+    if not sid_col:
+        raise ValueError("USTF preference: Student ID column not found for unmatched sheet.")
+
+    # Filter unmatched rows from the original sheet (preserve all columns)
+    keep_mask = original_ustf_df[sid_col].apply(lambda x: _get_id(x) not in matched_ustf_sids)
+    base = original_ustf_df[keep_mask].copy()
+
+    # Build a map: sid -> {pass flags}
+    pass_cols = {
+        "First Priority Pass": [],
+        "Second Priority Pass": [],
+        "Third Priority Pass": [],
+        "Fourth Priority Pass": [],
+    }
+
+    # If we have normalized df, use its evaluated flags; otherwise, recompute from ustf_map
+    if ustf_norm_df is not None and not ustf_norm_df.empty:
+        # Fast path: read per-row flags by SID
+        sid_norm_col = _find_col(ustf_norm_df, "Student ID") or "Student ID"
+        norm_by_sid = { _get_id(r[sid_norm_col]): r for _, r in ustf_norm_df.iterrows() }
+
+        for _, r in base.iterrows():
+            sid = _get_id(r[sid_col])
+            nr = norm_by_sid.get(sid, {})
+            pass_cols["First Priority Pass"].append( str(nr.get("First Priority Pass", "")) )
+            pass_cols["Second Priority Pass"].append( str(nr.get("Second Priority Pass", "")) )
+            pass_cols["Third Priority Pass"].append( str(nr.get("Third Priority Pass", "")) )
+            pass_cols["Fourth Priority Pass"].append( str(nr.get("Fourth Priority Pass", "")) )
+    else:
+        # Recompute from ustf_map.priorities
+        for _, r in base.iterrows():
+            sid = _get_id(r[sid_col])
+            u = ustf_map.get(sid)
+            flags = ["", "", "", ""]
+            if u:
+                pri = sorted(u.priorities, key=lambda x: x["order"])
+                for i in range(min(4, len(pri))):
+                    flags[i] = "YES" if pri[i]["pass_general"] else "NO"
+            pass_cols["First Priority Pass"].append(flags[0])
+            pass_cols["Second Priority Pass"].append(flags[1])
+            pass_cols["Third Priority Pass"].append(flags[2])
+            pass_cols["Fourth Priority Pass"].append(flags[3])
+
+    # Append pass columns on the right
+    for k, v in pass_cols.items():
+        base[k] = v
+    return base
 
 # ======================================================================
 # Streamlit UI
@@ -1024,7 +1548,7 @@ st.set_page_config(page_title="EasyMatcher CUHKSZ", layout="wide")
 st.title("📚 EasyMatcher for Course TA/USTF — Revised, Logged, & Capped")
 
 st.markdown(
-    "- **Step 1**: Upload all four XLSX files.\n"
+    "- **Step 1**: Upload all five XLSX files.\n"
     "- **Step 2**: Review previews.\n"
     "- **Step 3**: (Optional) Manual edit.\n"
     "- **Step 4**: Download assignment + logs."
@@ -1044,6 +1568,9 @@ with st.expander("📋 Required Files / Column Hints", expanded=False):
 
 **Student Preference:**
 - Columns: _Student ID_, _Full Name_ (or _Normalized Name_), four priority columns, _USTF Remark_, _Other information_
+
+**USTF Preference:**
+- Columns: _USTF Name_, _USTF ENG Name_, _USTF Email_, _cGPA_, etc.
         """
     )
 
@@ -1060,12 +1587,16 @@ instr_file = st.file_uploader("Upload Instructor Preference 👇", type=["xlsx"]
 st.markdown("### 4) Student Preference XLSX")
 stud_file = st.file_uploader("Upload Student Preference 👇", type=["xlsx"], key="stud")
 
-if assign_file and namelist_file and instr_file and stud_file:
+st.markdown("### 5) USTF Preference XLSX")
+ustf_file = st.file_uploader("Upload USTF Preference 👇", type=["xlsx"], key="ustf")
+
+if assign_file and namelist_file and instr_file and stud_file and ustf_file:
     try:
         assign_df = _read_main_or_first(assign_file, prefer=["UG+PG"])
         names_df  = _read_main_or_first(namelist_file)
         instr_df  = _read_main_or_first(instr_file)
         stud_df   = _read_main_or_first(stud_file)
+        ustf_df   = _read_main_or_first(ustf_file)
     except Exception as e:
         st.error(f"Failed to read XLSX files: {e}")
         LOG.log("ERROR", "READ_FAIL", detail=str(e))
@@ -1073,18 +1604,40 @@ if assign_file and namelist_file and instr_file and stud_file:
 
     # Build structures
     courses_assign = load_teaching_assignment(assign_df)
+    st.session_state.original_assign_df_source = assign_df
+
     courses_instr  = load_instructor_sheet(instr_df)
     id_to_profile, name_to_id_from_names = load_ta_name_list(names_df)
     stud_pref_map = load_student_prefs(stud_df)
+    # --- USTF normalization & map
+    ustf_map, ustf_name_to_sid, ustf_norm_df = load_ustf_preference(ustf_df)
+    st.session_state.ustf_map = ustf_map
+    st.session_state.ustf_norm_df = ustf_norm_df
 
     # Merge student map & comprehensive name->id dictionary
     student_map, name_to_id = build_student_map(id_to_profile, stud_pref_map)
+    st.session_state.student_map = student_map  # <-- ensure available before USTF matching
 
-    # Revised matching (initial pass)
+    # Revised TA matching (initial pass)
     matched_sids = perform_matching(courses_instr, courses_assign, student_map, name_to_id)
 
     # Iteratively rematch until stable: prune → fill → prune, repeat
     iterative_match_until_stable(courses_assign, student_map, matched_sids)
+
+    # --- USTF matching (uses ustf quotas from Teaching Assignment)
+    matched_ustf_sids, unmatched_ustf_df = match_ustf(
+        courses_assign, courses_instr, ustf_map, ustf_name_to_sid
+    )
+
+    # Keep original ustf preference sheet handy
+    st.session_state.original_ustf_df = ustf_df
+    # unmatched USTF df (full original cols + Pass)
+    st.session_state.unmatched_ustf_df = build_unmatched_ustf_dataframe(
+        original_ustf_df=ustf_df,
+        ustf_map=ustf_map,
+        matched_ustf_sids=matched_ustf_sids,
+        ustf_norm_df=ustf_norm_df
+    )
 
     # Build outputs
     assign_df_out = build_assignment_dataframe(courses_assign, id_to_profile, assign_df)
@@ -1102,6 +1655,12 @@ if assign_file and namelist_file and instr_file and stud_file:
     # Previews
     st.subheader("📑 Preview — Course Assignments (Teaching Assignment format)")
     st.dataframe(st.session_state.assign_df, use_container_width=True, height=420)
+
+    st.subheader("📄 Preview — USTF (normalized)")
+    st.dataframe(st.session_state.ustf_norm_df, use_container_width=True, height=300)
+
+    st.subheader("🚧 USTF Still Unmatched")
+    st.dataframe(st.session_state.unmatched_ustf_df, use_container_width=True, height=220)
 
     # With guaranteed completion + caps, some students may become unmatched if caps are tight
     st.subheader("🚧 Students Still Unmatched")
@@ -1197,7 +1756,7 @@ if assign_file and namelist_file and instr_file and stud_file:
                     # Rebuild via iterative fill until stable
                     iterative_match_until_stable(st.session_state.courses, st.session_state.student_map, st.session_state.matched)
                     st.session_state.assign_df = build_assignment_dataframe(
-                        st.session_state.courses, st.session_state.id_to_profile
+                        st.session_state.courses, st.session_state.id_to_profile, st.session_state.original_assign_df_source
                     )
                     st.session_state.unmatched_df = build_unmatched_dataframe(
                         st.session_state.student_map, st.session_state.matched
@@ -1212,30 +1771,41 @@ if assign_file and namelist_file and instr_file and stud_file:
     st.subheader("⬇️ Downloads")
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        # Write sheets
-        st.session_state.assign_df.to_excel(writer, index=False, sheet_name="UG+PG")
-        st.session_state.unmatched_df.to_excel(writer, index=False, sheet_name="Unmatched")
+        # TA sheet
+        st.session_state.assign_df.to_excel(writer, index=False, sheet_name="TA")
+        # USTF sheet (separate)
+        ustf_out_df = build_ustf_dataframe(st.session_state.courses, st.session_state.original_assign_df_source if "original_assign_df_source" in st.session_state else assign_df)
+        st.session_state.ustf_df_out = ustf_out_df
+        ustf_out_df.to_excel(writer, index=False, sheet_name="USTF")
+        # Unmatched (TAs)
+        st.session_state.unmatched_df.to_excel(writer, index=False, sheet_name="Unmatched TA")
+        # Unmatched USTF + USTF Normalized (added in section C below)
+        if "unmatched_ustf_df" in st.session_state:
+            st.session_state.unmatched_ustf_df.to_excel(writer, index=False, sheet_name="Unmatched USTF")
+        # if "ustf_norm_df" in st.session_state:
+        #     st.session_state.ustf_norm_df.to_excel(writer, index=False, sheet_name="USTF Normalized")
 
-        # --- NEW ⬇ merge common columns per course in the UG+PG sheet
+        # Merge cells on TA sheet
         try:
             wb = writer.book
-            ws = writer.sheets["UG+PG"]
-
-            # Columns to merge = the original TA Assignment columns (not TA-per-row columns)
+            ws_ta = writer.sheets["TA"]
             original_cols = st.session_state.get("original_assign_cols", [])
-            # UNMERGE_COLS = TA_RESULT_COLS.extend(['Supervisor', 'Cohort', 'Major', 'USTF ID'])
             columns_to_merge = [c for c in original_cols if c not in TA_RESULT_COLS]
-            # Identify the "Course Code" column name in the *final* df (it’s preserved)
             code_col_name = _find_col(st.session_state.assign_df, "Course Code") or "Course Code"
-
-            _merge_common_columns_in_excel(
-                ws,
-                st.session_state.assign_df,
-                code_col_name,
-                columns_to_merge
-            )
+            _merge_common_columns_in_excel(ws_ta, st.session_state.assign_df, code_col_name, columns_to_merge)
         except Exception as e:
             LOG.log("WARN", "MERGE_CELLS_FAILED", detail=str(e))
+
+        # Merge cells on USTF sheet (same rule)
+        try:
+            ws_ustf = writer.sheets["USTF"]
+            original_cols = st.session_state.get("original_assign_cols", [])
+            columns_to_merge2 = [c for c in original_cols if c not in USTF_RESULT_COLS]
+            code_col_name2 = _find_col(st.session_state.ustf_df_out, "Course Code") or "Course Code"
+            _merge_common_columns_in_excel(ws_ustf, st.session_state.ustf_df_out, code_col_name2, columns_to_merge2)
+        except Exception as e:
+            LOG.log("WARN", "MERGE_CELLS_FAILED_USTF", detail=str(e))
+
     
     buffer.seek(0)
     st.download_button(
@@ -1256,4 +1826,4 @@ if assign_file and namelist_file and instr_file and stud_file:
         mime="text/csv",
     )
 else:
-    st.info("Please upload all four files to start (Teaching Assignment, TA Name List, Instructor Preference, Student Preference).")
+    st.info("Please upload all five files to start (Teaching Assignment, TA Name List, Instructor Preference, Student Preference, USTF Preference).")
